@@ -6,7 +6,7 @@
 
 import logging
 import os
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -17,10 +17,15 @@ logger = logging.getLogger("vptq.quantize.hessian")
 # Hadamard-absorbed (vptq/tools/deepseek_v4/rotate_ckpt.py). These are the
 # groups feeding input-side-rotated weights: mlp_in (w1/w3/router) and the
 # attention linears that read the normalized residual stream.
-_ROTATED_ATTN_KEYS = frozenset({
-    "attn.wq_a", "attn.wkv", "attn.compressor.wkv",
-    "attn.compressor.wgate", "attn.indexer.weights_proj",
-})
+_ROTATED_ATTN_KEYS = frozenset(
+    {
+        "attn.wq_a",
+        "attn.wkv",
+        "attn.compressor.wkv",
+        "attn.compressor.wgate",
+        "attn.indexer.weights_proj",
+    }
+)
 
 
 def is_rotated_group(group_key: str, wrap: bool = False) -> bool:
@@ -34,8 +39,15 @@ def is_rotated_group(group_key: str, wrap: bool = False) -> bool:
     """
     if group_key.endswith("mlp_in"):
         return True
-    if wrap and group_key.startswith("ffn.experts.") \
-            and group_key.endswith(".w2"):
+    if wrap and (
+        (group_key.startswith("ffn.experts.") and group_key.endswith(".w2"))
+        or (
+            group_key.startswith("mlp.experts.")
+            and group_key.endswith("down_proj")
+        )
+    ):
+        # qwen3_5_moe packed 布局的 per-expert down_proj 同理（wrap 模式
+        # 全部量化叶子都是输入侧）
         return True
     return group_key in _ROTATED_ATTN_KEYS
 
@@ -98,10 +110,18 @@ class HessianStore:
     scheme, unlike the absorbed pipeline).
     """
 
-    def __init__(self, hessian_dir: str, rotation_path: Optional[str] = None,
-                 wrap: bool = False):
+    def __init__(
+        self,
+        hessian_dir: str,
+        rotation_path: Optional[str] = None,
+        wrap: bool = False,
+        identity_dims: Optional[Callable[[str], int]] = None,
+    ):
         self.dir = hessian_dir
         self.wrap = wrap
+        # 缺组回退单位阵的维度（模型相关）：None = DSV4 语义（.w2→2048，
+        # 其余→4096）；qwen3_5_moe 传 mlp_in→hidden / down_proj→inter
+        self.identity_dims = identity_dims
         self._cache_idx: Optional[int] = None
         self._cache: Optional[Dict[str, dict]] = None
         self.R: Optional[torch.Tensor] = None
@@ -140,11 +160,17 @@ class HessianStore:
             # 小语料（如 calibR9 49 条）下 0 命中的冷门专家无 Hessian 组：
             # 回退单位阵——加权退化为均匀、误差传播退化为近恒等，
             # 该专家等价朴素 VQ（无校准信息下的最保守行为）
-            n = 2048 if group_key.endswith(".w2") else 4096
+            if self.identity_dims is not None:
+                n = self.identity_dims(group_key)
+            else:
+                n = 2048 if group_key.endswith(".w2") else 4096
             logger.warning(
                 "group %s missing at layer %d (zero-hit expert); "
                 "fall back to identity Hessian (%dx%d)",
-                group_key, layer_idx, n, n,
+                group_key,
+                layer_idx,
+                n,
+                n,
             )
             return torch.eye(n), None
         H, inv = entry["hessian"], entry.get("inv_hessian")
