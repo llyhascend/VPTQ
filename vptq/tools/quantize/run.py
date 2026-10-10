@@ -345,6 +345,11 @@ def quantize_layer(
         if dual_norm:
             qw1.row_scale, qw1.col_scale = s1s, d_joint
             qw3.row_scale, qw3.col_scale = s3s, d_joint
+        elif row_fp8:
+            # row-fp8 only: W was quantized in the amplified FP8 domain
+            # (448/peak); rebuild must fold back with 1/fp (same as w2).
+            qw1.row_scale, qw1.col_scale = 1.0 / fp1, None
+            qw3.row_scale, qw3.col_scale = 1.0 / fp3, None
         logger.info(
             "  w1 proxy_error=%.5f  w3 proxy_error=%.5f",
             qw1.proxy_error, qw3.proxy_error,
