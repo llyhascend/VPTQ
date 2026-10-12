@@ -345,7 +345,7 @@ GEMV kernel 按 `IDXBITS/ResidualBits/GROUPSIZE` 模板特化（`csrc/quant_gemv
 4. **`collect_hessian.py`**：逐层挂钩采集、断点续跑（有效 layer 文件自动跳过）、官方 RedPajama 配比采样；
 5. **集群韧性**（本环境"空闲加速器回收 + 随机杀进程"必需）：
    - 加载期 NPU keep-alive（每 shard 一个小算子，防止驱动会话被回收）；
-   - 权重本地 NVMe 副本（`/root/dsv4-weights`），脱离 NFS 慢读/掉线；
+   - 权重 NFS 直读（`/mnt/share/weight/DeepSeek-V4-Flash-BF16`，543G/46 分片；早期本地 NVMe 副本 `/root/dsv4-weights` 方案已废弃，新容器不再提供）；
    - 看门狗脚本自动重试（`run_collect_rpmix.sh`，本地副本就绪后自动切换 `--ckpt`），配合 resume 逻辑使重启代价 ≈ 3~5 分钟。
 
 ---
@@ -403,6 +403,7 @@ GEMV kernel 按 `IDXBITS/ResidualBits/GROUPSIZE` 模板特化（`csrc/quant_gemv
 | VPTQ 32×32 无残差 + calibR9 | R9tau（同上） | **2.25 bit** | 68.18 / 70.20 / 68.69 / 66.16（**68.31**，σ=1.6） | 60.00 / 66.67（**63.33**） |
 | VPTQ 32×32 + calibR9 + 12.5% 专家回退 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 73.23 / 68.69 / 70.20 / 69.70 / 70.20 / 71.21（**70.54**，6 轮，σ≈1.5） | 70.00 / 56.67 / 56.67（**61.11**，σ=7.7） |
 | VPTQ 32×32 + calibR9 + row-fp8 + 12.5% 专家回退（rf32fb） | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 75.25 / 69.70 / 70.71（**71.89**，σ≈2.4） | 73.33 / 60.00 / 60.00（**64.44**，σ=6.1） |
+| VPTQ 32×32 + calibR9 + row-fp8 + 12.5% 专家回退（rf32fb）+ moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 68.18/67.68/71.21/72.73/67.17（**69.39**，σ≈2.18） | 76.67/70.00（**73.34**，σ≈3.34） |
 | VPTQ 32×16 + calibR9 + dual-norm + row-fp8 | R9tau（同上） | 2.50 bit | 74.24 / 71.21 / 69.70（**71.72**，σ≈2.3） | 73.33 / 66.67 / 73.33（**71.11**，σ≈3.9） |
 
 calibR9 采集为严格基线口径（无 token-floor、无 save-inv、128×4096，仅数据源换为 `calib_corpus_R9tau.jsonl`）；6 个 0 命中专家无 Hessian 组，量化时单位阵回退。
@@ -818,7 +819,8 @@ rebuild_bf16.py --fallback-list <json>     组件③：pass_rebuild 循环内按
 | `vptq-calibR9-t32x32-bf16` | 32×32 + calibR9 | 68.31 |
 | `vptq-calibR9-t32x32fb-bf16` | 32×32 + 12.5% gate 回退 | 70.54 |
 | `vptq-calibR9-dnrowfp8-bf16` | 32×16 + dual-norm + row-fp8 | 71.72 |
-| `vptq-calibR9-rf16fb-bf16` | **32×16 + row-fp8 + gate 回退（09-29 进行中）** | 待评测 |
+| `vptq-calibR9-rf32fb-bf16` | 32×32 + 纯 row-fp8 + 12.5% gate 回退（折回 bug 修复后重跑） | 71.89 / 64.44（§8A.2 第 5b 行） |
+| `vptq-calibR9-rf16fb-bf16` | 32×16 + row-fp8 + gate 回退 | **折回 bug 废数据**（§8A.7b'，作对比数据点须用修复后代码重跑） |
 
 **C. 部署权重（vllm serve 入口，153GB each）**
 
@@ -833,7 +835,9 @@ rebuild_bf16.py --fallback-list <json>     组件③：pass_rebuild 循环内按
 | `vptq-calibR9-tile16-...` | 32×16+calibR9（72.22） | 已评测（主结果） |
 | `vptq-calibR9-t32x32[-fb]-...` | 32×32 系 | 已评测 |
 | `vptq-calibR9-dnrowfp8-...` | dual-norm+row-fp8 | 已评测 |
-| `vptq-calibR9-rf16fb-...` | **row-fp8+回退（S5 进行中）** | 待评测 |
+| `vptq-calibR9-rf32fb-attnw8a8-moew4a8` | 32×32+纯 row-fp8+回退（71.89/64.44，bug 修复后重跑） | 已评测（REPORT 20261009） |
+| `vptq-calibR9-rf32fb-attnw8a8-moew8a8` | rf32fb 同基座换 moeW8A8 部署（69.39/73.34） | 已评测 |
+| `vptq-calibR9-rf16fb-...` | 32×16 基座 row-fp8+回退 | **折回 bug 废数据**（勿评测，须重跑） |
 | `w4a4-*`、`attnNative-*`、`BF16-rot2`、`vbench` | 早期/其他线产物 | 历史存档 |
 
 **D. 隔离区**：`_OVERWRITTEN_*` 两个污染部署目录已于 2026-09-29 确认删除（原数据均在事故前完成评测，无损失，释放 ~306G）。
