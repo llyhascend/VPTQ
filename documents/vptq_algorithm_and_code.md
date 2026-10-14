@@ -404,6 +404,7 @@ GEMV kernel 按 `IDXBITS/ResidualBits/GROUPSIZE` 模板特化（`csrc/quant_gemv
 | VPTQ 32×32 + calibR9 + 12.5% 专家回退 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 73.23 / 68.69 / 70.20 / 69.70 / 70.20 / 71.21（**70.54**，6 轮，σ≈1.5） | 70.00 / 56.67 / 56.67（**61.11**，σ=7.7） |
 | VPTQ 32×32 + calibR9 + row-fp8 + 12.5% 专家回退（rf32fb） | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 75.25 / 69.70 / 70.71（**71.89**，σ≈2.4） | 73.33 / 60.00 / 60.00（**64.44**，σ=6.1） |
 | VPTQ 32×32 + calibR9 + row-fp8 + 12.5% 专家回退（rf32fb）+ moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 68.18/67.68/71.21/72.73/67.17（**69.39**，σ≈2.18） | 76.67/70.00（**73.34**，σ≈3.34） |
+| VPTQ 32×32 + calibR9 + 32-Hadamard  +row-fp8 + 12.5% 专家回退（rf32fb）+ vptq直通&moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 70.71/73.74/69.70（**71.38**，σ≈2.10） | 73.33/60.00/73.33（**68.89**，σ≈7.70） |
 | VPTQ 32×16 + calibR9 + dual-norm + row-fp8 | R9tau（同上） | 2.50 bit | 74.24 / 71.21 / 69.70（**71.72**，σ≈2.3） | 73.33 / 66.67 / 73.33（**71.11**，σ≈3.9） |
 
 calibR9 采集为严格基线口径（无 token-floor、无 save-inv、128×4096，仅数据源换为 `calib_corpus_R9tau.jsonl`）；6 个 0 命中专家无 Hessian 组，量化时单位阵回退。
@@ -797,6 +798,49 @@ rebuild_bf16.py --fallback-list <json>     组件③：pass_rebuild 循环内按
 增益（gate 高分偏高频通用专家，数学冷门专家未覆盖；混合准则 gate×冷门度是
 改进方向）。
 
+### 8A.7d rf32wfb 生产全链：t32×32 + calibR9 + 分块 Hadamard R + row-fp8 + 12.5% gate 回退 → VPTQ 直通 & moeW8A8 部署（2026-10-12/13）
+
+**全链完成：S1–S5 走管线；S6（vllm 起服）与 S7（六轮评测）于 10-13 上午手动执行（10:12–11:07）；S8 数据已并入 §8A.2 表。**
+
+#### 线路组成
+
+| 组件 | 取值 |
+|---|---|
+| 基座 | t32×32（VPTQ tile 32×32） |
+| 校准 | calibR9（R9tau 语料；Hessian、inv、gate_scores 均复用） |
+| 旋转 | 分块 Hadamard R（块大小 32，非整矩阵 H；wrap 封装进每个专家矩阵内部） |
+| row-fp8 | `--row-fp8`（FP8 表示域量化，配方同 rf32fb） |
+| 回退 | 12.5% gate 分数：688 full + 2064 down_only |
+| 部署 | VPTQ 直通（`MXWeightPerBlockScaleOne`）+ moeW8A8 |
+
+#### 阶段进度（S1–S5）
+
+| 阶段 | 状态 | 产物 |
+|---|---|---|
+| S1 Hessian calibR9 | ✅ 复用 | `hessians/DeepSeek-V4-Flash-BF16-calibR9` |
+| S2 inverse | ✅ 复用 | inv + gate_scores.json |
+| S3 quant（wrap+row-fp8） | ✅ 10-12 18:14 | `quant/dsv4-tile32x32-rowfp8-wrap-fb-calibR9`：344/344 .pt |
+| S4 rebuild BF16 | ✅ 10-12 20:03 | `vptq-calibR9-rf32wfb-bf16`：46/46 |
+| S5 msmodelslim deploy | ✅ 10-13 09:58 | 72/72 shard；index 零缺失（69187 tensor） |
+
+#### 自检（全部通过，勿重做）
+
+1. **S5 分流全量扫描**：28896 个 VPTQ 矩阵（scale 为 uint8 恒 127，即 E8M0 编码的 scale=1）+ 4128 个回退矩阵（minmax 多值 114-118）；矩阵级零错分流。
+2. **cast 损伤留档**：24 个矩阵抽样，Frobenius 相对误差中位数 3.01%（范围 2.91-3.06%），跨层/专家稳定无异常点，结果见 QUANT/cast_injury_report.json。
+3. **HCCL 8 卡 sanity**：allreduce/allgather/broadcast ALL PASS.
+
+#### 评测结果（10-13 上午，手动六轮）
+
+| 数据集 | 各轮 | 均值 | σ |
+|---|---|---|---|
+| GPQA_diamond | 70.71 / 73.74 / 69.70 | **71.38** | 2.10 |
+| aime2024 | 73.33 / 60.00 / 73.33 | **68.89** | 7.70 |
+
+产物：`benchmark/outputs/default/20261013_{101207,101915,103125,104337,105048,110302}`；
+对照锚点：rf32fb+moeW4A8=71.89/64.44，rf32fb+moeW8A8=69.39/73.34，基线=73.99/71.67。
+
+解读：GPQA 71.38 与 rf32fb 两部署（71.89/69.39）同档；aime 68.89 显著高于 rf32fb+moeW4A8 的 64.44，
+接近 rf32fb+moeW8A8 的 73.34 但未追平；相对基线（73.99/71.67）仍差距 ~2.6/~2.8。
 ### 8A.7e weights 目录用途与策略总表（活文档：新产物须同步更新本表）
 
 磁盘：`/mnt/share/w00608002/weights`（≈19T）。命名约定：`-bf16` 后缀 = VPTQ 重建中间产物
@@ -821,6 +865,7 @@ rebuild_bf16.py --fallback-list <json>     组件③：pass_rebuild 循环内按
 | `vptq-calibR9-dnrowfp8-bf16` | 32×16 + dual-norm + row-fp8 | 71.72 |
 | `vptq-calibR9-rf32fb-bf16` | 32×32 + 纯 row-fp8 + 12.5% gate 回退（折回 bug 修复后重跑） | 71.89 / 64.44（§8A.2 第 5b 行） |
 | `vptq-calibR9-rf16fb-bf16` | 32×16 + row-fp8 + gate 回退 | **折回 bug 废数据**（§8A.7b'，作对比数据点须用修复后代码重跑） |
+| `vptq-calibR9-rf32wfb-bf16` | 32x32 + calibR9 + 分块 Hadamard R | S5 部署产物已就绪，评测未跑，见 8A.7d |
 
 **C. 部署权重（vllm serve 入口，153GB each）**
 
@@ -837,6 +882,7 @@ rebuild_bf16.py --fallback-list <json>     组件③：pass_rebuild 循环内按
 | `vptq-calibR9-dnrowfp8-...` | dual-norm+row-fp8 | 已评测 |
 | `vptq-calibR9-rf32fb-attnw8a8-moew4a8` | 32×32+纯 row-fp8+回退（71.89/64.44，bug 修复后重跑） | 已评测（REPORT 20261009） |
 | `vptq-calibR9-rf32fb-attnw8a8-moew8a8` | rf32fb 同基座换 moeW8A8 部署（69.39/73.34） | 已评测 |
+| `DeepSeek-V4-Flash-vptq-calibR9-rf32wfb-attnw8a8-moew8a8` | rf32wfb: t32x32+calibR9+分块 Hadamard+row-fp8+12.5% gate 回退，VPTQ 直通部署 | S5 已完成（72/72），S6-S8 未启动，见 8A.7d |
 | `vptq-calibR9-rf16fb-...` | 32×16 基座 row-fp8+回退 | **折回 bug 废数据**（勿评测，须重跑） |
 | `w4a4-*`、`attnNative-*`、`BF16-rot2`、`vbench` | 早期/其他线产物 | 历史存档 |
 

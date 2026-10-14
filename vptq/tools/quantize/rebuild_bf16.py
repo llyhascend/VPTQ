@@ -181,7 +181,46 @@ def pass_rebuild(args):
             done += 1
         logger.info("layer %d: rebuilt %d/%d experts", layer_idx, done,
                     len(quant))
+        if getattr(args, "fallback_mxfp4", False):
+            fb_done = _rebuild_fallback_mxfp4(
+                args, layer_idx, fb_full | fb_down, wmap, device)
+            logger.info("layer %d: fallback mxfp4 %d parts", layer_idx,
+                        fb_done)
         del quant
+
+
+def _rebuild_fallback_mxfp4(args, layer_idx, fb_keys, wmap, device):
+    """Pre-quantize fallback experts in wrap domain (2026-10-14).
+
+    part = mxfp4_ceilx_roundtrip(W @ R, 7.25) @ R^T, stored BF16;
+    assemble swaps it into the checkpoint, and the deploy yaml rule B
+    (method scale_one) performs the final e4m3 cast. R is the same
+    block-diagonal Hadamard (block=32, seed=0) as VPTQ expert wrap.
+    """
+    from vptq.tools.quantize.hadamard import wrap_rotation
+    from vptq.tools.quantize.mxfp4_ceilx import mxfp4_ceilx_roundtrip
+
+    done = 0
+    for li, short in sorted(fb_keys):
+        if li != layer_idx:
+            continue
+        full = f"layers.{li}.{short}"
+        if full not in wmap:
+            logger.warning("fallback not in checkpoint index: %s", full)
+            continue
+        out_path = os.path.join(args.parts_dir, full + ".safetensors")
+        if os.path.exists(out_path):
+            continue
+        shard = os.path.join(args.ckpt, wmap[full])
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            W = f.get_tensor(full).to(device)
+        R = wrap_rotation(W.shape[1]).to(device)
+        V = W.float() @ R
+        Vdq = mxfp4_ceilx_roundtrip(V)
+        part = (Vdq @ R.t()).to(torch.bfloat16).cpu().contiguous()
+        save_file({"w": part}, out_path)
+        done += 1
+    return done
 
 
 def wmap_shape(ckpt, wmap, name):
@@ -255,6 +294,13 @@ def main():
         help="fallback_list.json (from vptq.tools.quantize.fallback_list): "
         "listed experts keep original BF16 (full: w1+w2+w3; down_only: w2) "
         "and go through msmodelslim's standard W4A8 path instead of VPTQ.",
+    )
+    p.add_argument(
+        "--fallback-mxfp4", action="store_true",
+        help="Pre-quantize fallback experts too: W @ R (block-diag Hadamard "
+        "block=32, seed=0) -> mxfp4 ceil_x(7.25) roundtrip -> @ R^T, stored "
+        "as BF16 parts. Requires the deploy yaml rule B to use scale_one "
+        "for the final e4m3 cast.",
     )
     p.add_argument(
         "--wrap-rotation",
