@@ -25,13 +25,13 @@ VLLM_BASE2=/mnt/share/w00608002/work/vllm-ascend/vllm_start_base2.sh
 mkdir -p "$STATE"
 log(){ echo "[night $(date '+%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
-# ---------- 评测/基线严格等下一个 02:00（今天未到等今天，已过等明天）----------
+# ---------- 全链（含 msmodelslim）等下一个 02:00（今天未到等今天，已过等明天）----------
 wait_0200(){
   local now=$(date +%s)
   local t0=$(date -d "today 02:00" +%s)
   [ "$now" -ge "$t0" ] && t0=$(date -d "tomorrow 02:00" +%s)
   if [ "$now" -lt "$t0" ]; then
-    log "等待 02:00 启动评测链（$(( (t0-now)/60 )) 分钟后）"
+    log "等待 02:00 启动全链（$(( (t0-now)/60 )) 分钟后）"
     sleep $((t0-now))
   fi
 }
@@ -46,6 +46,11 @@ wait_idle(){
   done
   log "02:00+2h 仍不空闲，本轮放弃（看门狗重试）"; return 1
 }
+
+# ---- 全部阶段（A/B/C/D）统一：02:00 + NPU 空闲后才开跑（用户 10-14 修正指令）----
+wait_0200
+wait_idle || exit 0
+log "02:00+空闲，夜间链开跑"
 
 # ---------- 通用：vllm 保活 ----------
 ensure_vllm(){
@@ -121,15 +126,10 @@ run_slim(){
   done
 }
 
-# ================= Phase A：fb4 S5'（立即收尾，无需等 02:00）=================
+# ================= Phase A：fb4 S5' =================
 if [ ! -f "$STATE/a.done" ]; then
   run_slim "$FB4_BF16" "$FB4_DEPLOY" "$FB4_YAML" fb4 && touch "$STATE/a.done" || exit 1
 fi
-
-# ---- 以下评测/基线链：等下一个 02:00 且 NPU 空闲 ----
-wait_0200
-wait_idle || exit 0
-log "02:00+空闲，评测链开跑"
 
 # ================= Phase B：fb4 评测 =================
 if [ ! -f "$STATE/b.done" ]; then

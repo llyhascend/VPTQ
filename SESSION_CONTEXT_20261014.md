@@ -1,7 +1,38 @@
-# 会话上下文交接（2026-10-14 深夜更新，夜间链挂机中）
+# 会话上下文交接（2026-10-15 上午更新：夜间事故复盘与修复就绪）
 
-> 接续同日早间版本（fb4 设计与实现）。本文档覆盖：S5' 中断与自愈、
-> 夜间评测链部署（用户 17:15 指令）、全部资产清单。
+> 接续同日版本。本文档覆盖：夜间链执行结果、**QUANT 目录事故根因**、
+> 修复状态（文件已改好，等待用户指令重跑）。
+
+## ⓪ 10-15 上午最新状态（先读这里）
+
+- **夜间链失败根因已定位并修复文件**：fb4 驱动 QUANT 误用 rf32fb 的
+  `dsv4-tile32x32-rowfp8-fb-calibR9`（无 wrap），rebuild `@Rᵀ` 后
+  28896 个 VPTQ parts 全部污染（实测 rel=1.42、97.6% 元素错位、
+  与生产 rf32wfb deploy DIFFER）；fallback 4128 parts 不读 quant 目录、
+  **无辜且正确**（实测 rel=11.7%≈wrap+cast 预期、输出 cos=0.993、
+  scale≡127 全对）。
+- **已改**：`quantize_dsv4_experts_rf32wfb_fb4.sh` QUANT 指向
+  `...rowfp8-wrap-fb-calibR9` + 启动 guard（目录名不含 wrap 即中止）。
+- **已备好未运行**：`reset_and_rerun_fb4.sh`（清 28896 污染 parts 保留
+  fallback、删污染 BF16/DEPLOY、重跑 S4'+S5'，内含数量断言 4128/28896）。
+  **用户指令触发才跑**。
+- 夜间链（night_pipeline/night_watchdog）已全部停止；其 STATE 的 a.done
+  与 fb4 deploy index 均属污染版，reset 脚本会清。
+- 重跑验收判据：S4 后 VPTQ part 与生产 rf32wfb deploy **逐位一致**
+  （10-15 检查 3 复跑应 IDENTICAL）。
+
+## ⓪' 夜间链执行事实（10-15 02:00-09:10）
+
+1. 02:00 准时起跑 ✓（全链等 02:00 版本生效）
+2. Phase A fb4 S5'：05:38 完成（3.6h，killer 反复杀→看门狗自愈，最终
+   72/72 + index ✓）
+3. Phase B：vllm(fb4) 05:45 就绪+预热 ✓ → gpqa 前 4 轮每轮 40min 超时
+   **0 预测**（576 行请求无一个 finish_reason——权重乱码不自停）；
+   第 5 轮 warmup 全 500；08:48 重启 vllm 4 分钟后再崩（HCCL/AICPU
+   kernel exception，libccl_kernel.so RunAicpuIndOpCommInit）
+4. Phase C/D 未开始；09:10 我停掉全部组件止住空转
+5. 09:3x 低成本权重验证（用户指令）：三层检查定位根因（见 ⓪）
+
 
 ## 一、夜间任务（用户指令原文要点）
 

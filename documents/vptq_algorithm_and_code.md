@@ -393,19 +393,41 @@ GEMV kernel 按 `IDXBITS/ResidualBits/GROUPSIZE` 模板特化（`csrc/quant_gemv
 
 注：位宽为 VPTQ 预处理侧的专家表示位宽（索引+码本摊销）；各组最终部署格式统一为 attnW8A8 + moeW4A8(mxfp4)，注意力均为 W8A8，差异只在专家路径。评测期间 vLLM 被环境进程杀手 SIGKILL 十余次，各组成绩系"接力"凑齐；aime（30 题）单题 3.33 分，轮间波动天然较大（如混合组 60.00~80.00）。
 
-**单变量对照：Hessian 数据源 / tile 尺寸 / gate 分数回退 / FP8 域归一化（2026-09-23~29）**
+**单变量对照：Hessian 数据源 / tile 尺寸 / gate 分数回退 / FP8 域归一化 / 回退域 mxfp4 预量化（2026-09-23~29、10-16~17）**
 
 | 组别 | Hessian 数据源 | 专家位宽 | GPQA 各轮（均值） | aime2024 各轮（均值） |
 |---|---|---|---|---|
-| attnw8a8ceil+moeW4A8（floor→ceil 修复，基线） | —（ModelSlim 直量化，无 VPTQ） | ~4.25 bit | 75.25 / 71.72 / 75.76 / 73.23（**73.99**） | 73.33 / 70.00（**71.67**） |
-| VPTQ 32×16 无残差 | RedPajama rpmix（官方 6-slice 配比） | 2.50 bit | 64.14 / 68.18 / 64.65 / 65.15（**65.53**） | 70.00 / 80.00 / 63.33（**71.11**） |
-| VPTQ 32×16 无残差 + calibR9 | **R9tau 评测对齐语料（203k token / 49 条）** | 2.50 bit | 72.73 / 70.20 / 70.71 / 73.23 / 71.72 / 73.74 / 73.23（**72.22**，σ=1.3） | 66.67 / 76.67 / 73.33（**72.22**，σ=4.2） |
-| VPTQ 32×32 无残差 + calibR9 | R9tau（同上） | **2.25 bit** | 68.18 / 70.20 / 68.69 / 66.16（**68.31**，σ=1.6） | 60.00 / 66.67（**63.33**） |
-| VPTQ 32×32 + calibR9 + 12.5% 专家回退 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 73.23 / 68.69 / 70.20 / 69.70 / 70.20 / 71.21（**70.54**，6 轮，σ≈1.5） | 70.00 / 56.67 / 56.67（**61.11**，σ=7.7） |
-| VPTQ 32×32 + calibR9 + row-fp8 + 12.5% 专家回退（rf32fb） | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 75.25 / 69.70 / 70.71（**71.89**，σ≈2.4） | 73.33 / 60.00 / 60.00（**64.44**，σ=6.1） |
-| VPTQ 32×32 + calibR9 + row-fp8 + 12.5% 专家回退（rf32fb）+ moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 68.18/67.68/71.21/72.73/67.17（**69.39**，σ≈2.18） | 76.67/70.00（**73.34**，σ≈3.34） |
-| VPTQ 32×32 + calibR9 + 32-Hadamard  +row-fp8 + 12.5% 专家回退（rf32fb）+ vptq直通&moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%） | 70.71/73.74/69.70（**71.38**，σ≈2.10） | 73.33/60.00/73.33（**68.89**，σ≈7.70） |
-| VPTQ 32×16 + calibR9 + dual-norm + row-fp8 | R9tau（同上） | 2.50 bit | 74.24 / 71.21 / 69.70（**71.72**，σ≈2.3） | 73.33 / 66.67 / 73.33（**71.11**，σ≈3.9） |
+| attnw8a8ceil+moeW4A8（floor→ceil 修复，基线） | —（ModelSlim 直量化，无 VPTQ） | ~4.25 bit | 75.25/71.72/75.76/73.23（**73.99**，σ≈1.9） | 73.33/70.00（**71.67**，σ≈2.4） |
+| VPTQ 32×16 无残差 | RedPajama rpmix（官方 6-slice 配比） | 2.50 bit | 64.14/68.18/64.65/65.15（**65.53**，σ≈1.8） | 70.00/80.00/63.33（**71.11**，σ≈8.4） |
+| VPTQ 32×16 无残差 + calibR9 | **R9tau 评测对齐语料（203k token / 49 条）** | 2.50 bit | 72.73/70.20/70.71/73.23/71.72/<br>73.74/73.23（**72.22**，σ=1.3） | 66.67/76.67/73.33（**72.22**，σ=4.2） |
+| VPTQ 32×32 无残差 + calibR9 | R9tau（同上） | **2.25 bit** | 68.18/70.20/68.69/66.16（**68.31**，σ=1.6） | 60.00/66.67（**63.33**，σ≈4.7） |
+| VPTQ 32×32 + calibR9 + 12.5% 专家回退 | R9tau（同上） | ~2.50 bit（2.25×87.5% +<br>4.25×12.5%） | 73.23/68.69/70.20/69.70/70.20/<br>71.21（**70.54**，σ≈1.5） | 70.00/56.67/56.67（**61.11**，σ=7.7） |
+| VPTQ 32×32 + calibR9 + row-fp8<br>+ 12.5% 专家回退（rf32fb） | R9tau（同上） | ~2.50 bit（2.25×87.5% +<br>4.25×12.5%） | 75.25/69.70/70.71（**71.89**，σ≈2.4） | 73.33/60.00/60.00（**64.44**，σ=6.1） |
+| VPTQ 32×32 + calibR9 + row-fp8<br>+ 12.5% 专家回退（rf32fb）+ moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% +<br>4.25×12.5%） | 68.18/67.68/71.21/72.73/67.17<br>（**69.39**，σ≈2.2） | 76.67/70.00（**73.34**，σ≈3.3） |
+| VPTQ 32×32 + calibR9 + 32-Hadamard +row-fp8<br>+ 12.5% 专家回退（rf32fb）<br>+ vptq直通&moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% +<br>4.25×12.5%） | 70.71/73.74/69.70（**71.38**，σ≈2.1） | 73.33/60.00/73.33（**68.89**，σ≈7.7） |
+| VPTQ 32×16 + calibR9 + dual-norm + row-fp8 | R9tau（同上） | 2.50 bit | 74.24/71.21/69.70（**71.72**，σ≈2.3） | 73.33/66.67/73.33（**71.11**，σ=3.9） |
+| VPTQ 32×32 + calibR9 + wrap + row-fp8 + 12.5% 专家回退<br>（rf32wfb-**fb4**：回退专家改 wrap 域 mxfp4 预量化）<br>+ vptq直通&moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%；<br>部署统一 8bit 直通存储） | 73.74/75.25/69.70/69.70/69.70<br>（**71.62**，σ≈2.7） | 73.33/76.67/66.67/83.33/76.67<br>（**75.33**，σ≈6.1） |
+| attnw8a8ceil + moe-scale1（原始 ckpt 路由专家<br>W8A8 直通，无 VPTQ，**基线2**） | —（ModelSlim 直量化，无 VPTQ） | 8 bit | 73.74/70.20/70.71/74.24/72.73<br>（**72.32**，σ≈1.8） | 63.33/70.00/66.67/70.00/70.00<br>（**68.00**，σ≈3.0） |
+
+注：数值列为逐轮分数（均值，σ=样本标准差，历史缺 σ 组本轮补算以 ≈ 标注）；~2.50 bit = 2.25×87.5% + 4.25×12.5%（VPTQ 专家 2.25 bit + 回退 mxfp4 4.25 bit）。
+
+**各实验组权重与配置目录**（权重前缀 `/mnt/share/w00608002/weights/`，yaml 前缀 `/mnt/share/w00608002/msmodelslim/deepseek-v4-flash-`；无 VPTQ 组直接量化原始 ckpt `/mnt/share/weight/DeepSeek-V4-Flash-BF16`）
+
+| # | 实验组 | QUANT 数据（quant/） | 重建 BF16 | 部署权重（vLLM 加载） | 部署 yaml |
+|---|---|---|---|---|---|
+| 1 | attnw8a8ceil+moeW4A8 基线 | — | — | attnw8a8ceil-moew4a8 | attenw8a8moew4a8.yaml（ceil 修复版） |
+| 2 | VPTQ 32×16 无残差 | dsv4-tile32x16-nores | 已清理 | vptq-tile16-attnw8a8-moew4a8 | 同 #1 |
+| 3 | 32×16 无残差 + calibR9 | dsv4-tile32x16-nores-calibR9 | 已清理 | 已清理（报告目录 20260923 留档） | 同 #1 |
+| 4 | 32×32 无残差 + calibR9 | dsv4-tile32x32-nores-calibR9 | vptq-calibR9-t32x32-bf16 | vptq-calibR9-t32x32-attnw8a8-moew4a8 | 同 #1 |
+| 5 | 32×32 + calibR9 + 12.5% 回退 | 同 #4 + fallback_list.json | vptq-calibR9-t32x32fb-bf16 | 已清理 | 同 #1 |
+| 6 | rf32fb（+row-fp8+回退） | dsv4-tile32x32-rowfp8-fb-calibR9 | vptq-calibR9-rf32fb-bf16 | vptq-calibR9-rf32fb-attnw8a8-moew4a8 | 同 #1 |
+| 7 | rf32fb + moeW8A8 | 同 #6 | 同 #6 | vptq-calibR9-rf32fb-attnw8a8-moew8a8 | attenw8a8moew8a8.yaml |
+| 8 | rf32wfb（+wrap）+ vptq直通&moeW8A8 | dsv4-tile32x32-rowfp8-wrap-fb-calibR9 | vptq-calibR9-rf32wfb-bf16 | vptq-calibR9-rf32wfb-attnw8a8-moew8a8 | 同 #7 |
+| 9 | 32×16 + calibR9 + dual-norm + row-fp8 | dsv4-tile32x16-dn-rowfp8-calibR9 | vptq-calibR9-dnrowfp8-bf16 | vptq-calibR9-dnrowfp8-attnw8a8-moew4a8 | 同 #1 |
+| 10 | fb4（rf32wfb + 回退改 wrap 域 mxfp4） | 同 #8（expert_parts/ 含回退 mxfp4 parts） | vptq-calibR9-rf32wfbfb4-bf16 | vptq-calibR9-rf32wfbfb4-attnw8a8-moew8a8 | attenw8a8-vptqw8a8scale1-moew8a8.yaml |
+| 11 | attnw8a8ceil + moe-scale1 基线2 | — | — | attnw8a8ceil-moescale1 | attnw8a8ceil-moescale1.yaml |
+
+注：QUANT 目录为 VPTQ 量化产物（`.pt` + `.parts/`），重建 BF16 为 `rebuild_bf16.py` 反量化装配后的全精度检查点，部署权重为 msmodelslim 按 yaml 产出的最终量化目录；#5 回退组与 #4 共用 quant 基座（回退专家不走 VPTQ，名单在 `fallback_list.json`），#10 fb4 与 #8 共用 wrap quant 基座（差异在重建阶段回退 parts 的 mxfp4 预量化与部署 yaml 的 scale_one 直通）。
 
 calibR9 采集为严格基线口径（无 token-floor、无 save-inv、128×4096，仅数据源换为 `calib_corpus_R9tau.jsonl`）；6 个 0 命中专家无 Hessian 组，量化时单位阵回退。
 
@@ -415,8 +437,9 @@ calibR9 采集为严格基线口径（无 token-floor、无 save-inv、128×4096
 2. **tile 尺寸轴**（第 3 vs 4 行）：行高 16→32（码本摊销减半，2.50→2.25bit）GPQA **−3.9**（72.22→68.31）——码本密度是 2bit 级 VPTQ 的第一精度杠杆；
 3. **回退轴**（第 4 vs 5 行）：12.5% gate 分数回退（专家分数 = sum(激活时 gate 分数) 降序：688 整专家 + 2064 down 层 = 4128 矩阵；`gate_scores.py`/`fallback_list.py`/`rebuild_bf16.py --fallback-list`，回退专家走 msmodelslim 标准 W4A8）→ GPQA **+2.4**（68.31→70.71）——排序依据从权重域 MSE（② 的 top20 无效）换成路由域 gate 分数后回退首次兑现；但同位宽下仍不敌 tile 密度（70.71 < 72.22），且对 aime 无增益（gate 高分偏高频通用专家，数学冷门专家未覆盖；混合准则 gate×冷门度是改进方向）。
 4. **FP8 域归一化 + 双尺度叠加轴**（第 3 vs 6 行，同 tile32×16）：量化前 out-dim 行峰对齐 e4m3 满量程 448（`run.py --row-fp8`，复合 row_scale=rms/fp8 折回，恒等性 1.5e-08）叠加 dual-norm → GPQA 71.72 / aime 71.11，与纯 tile16+calibR9（72.22/72.22）统计持平——**无损叠加但无净增益**：单轮 74.24 为 VPTQ 组历史首个超基线（73.99）轮次，证明 FP8 域对动态范围利用的改善真实存在，却被 dual-norm 的白化中性化抵消（⑤ 的教训再现）。**纯 row-fp8（不带 dual-norm）的隔离数据点已补**（rf32fb，第 5b 行，t32×32 基座 + 12.5% 回退同配置对照）：GPQA 71.89（单轮 75.25 与基线最高轮持平）/ aime 64.44——vs 同基座无 row-fp8（70.54/61.11）**GPQA +1.35、aime +3.33，row-fp8 单独贡献为正**；同位宽 GPQA 追平 32×16 系（72.22/71.72）但 aime 仍落后 7~8 分，tile 密度代价在 aime 上依旧成立。
+5. **回退域 mxfp4 预量化 + 统一 W8A8 直通轴**（rf32wfb→fb4，2026-10-16~17，第 9 vs 10 行）：回退专家从"msmodelslim 标准 W4A8"改为 **wrap 域 mxfp4 预量化**——`rebuild_bf16.py --fallback-mxfp4` 生成 part = mxfp4_ceilx_roundtrip(W·R, 7.25)·Rᵀ（R 为与 VPTQ 专家相同的分块对角 Hadamard block=32/seed=0，磁盘 part 对拍 rel=0.000000 逐位一致；原权重本在 mxfp4 网格上，wrap 引入 ~11.3% 表示误差为知情决策），部署侧 yaml 单规则 `*ffn.experts*` scale_one 直通 cast e4m3，路由专家（VPTQ 2bit 重建 + 回退 mxfp4 预量化）统一 8bit 存储 → GPQA 71.62（vs rf32wfb 71.38，+0.24 噪声内）、**aime 75.33 为全表最高**（vs 68.89，+6.44，σ≈6.1 方差内偏好）；同 W8A8 直通部署下对照基线2（原始 ckpt + moe-scale1，无 VPTQ）：GPQA 71.62 vs 72.32（−0.7 噪声内）、aime 75.33 vs 68.00（+7.33）——**VPTQ 2bit 重建专家在任务域追平无 VPTQ 直通基线**，结论④"k=16 级 VPTQ 预处理整体负收益"在 wrap + calibR9 + 回退 + W8A8 直通组合下不再成立。评测链路：`day_chain_fb4_base.sh`（assemble→部署→真实性验证→评测全自动，killer 自愈）；排障记录：killer 杀 vllm 后 `/dev/shm` psm_* 段泄漏致 64MB tmpfs 打满 → 后续实例并发请求整轮 500（预热单请求可过），`ensure_vllm` 已加死段自动清理。
 
-报告：`ais_bench_logs/vptq-calibR9-tile16-attnw8a8-moew4a8-20260923/`、`vptq-calibR9-t32x32fb-20260925/`、`vptq-calibR9-t32x32fb-extra7-20260928/`（回退组 GPQA 并至 6 轮 70.54）、`vptq-calibR9-dnrowfp8-20260929/`、`vptq-calibR9-rf32fb-attnw8a8-moew4a8-20261009/`（rf32fb 修复折回 bug 后重跑，见 §8A.7b'）。
+报告：`ais_bench_logs/vptq-calibR9-tile16-attnw8a8-moew4a8-20260923/`、`vptq-calibR9-t32x32fb-20260925/`、`vptq-calibR9-t32x32fb-extra7-20260928/`（回退组 GPQA 并至 6 轮 70.54）、`vptq-calibR9-dnrowfp8-20260929/`、`vptq-calibR9-rf32fb-attnw8a8-moew4a8-20261009/`（rf32fb 修复折回 bug 后重跑，见 §8A.7b'）、`benchmark/outputs/default/2026101{6,7}_*`（fb4 与基线2 各 5+5 轮，2026-10-16~17）。
 
 **结论**：① 残差贡献约 +3 分（65.30 vs 62.63）；② top20 定点修补无效（65.30 持平）——损伤是弥漫性的（k=16 码本整体粗糙），非尾部问题；③ **细块 32×16 是 VPTQ 各 tile 形态中最优**（GPQA 唯一超有残差组、aime 71.11 ≈ 基线 71.67）——局部码本密度 > 残差补偿，Tile 演进方向应继续缩小 tile 或增大 k（终局最优组 wrap 亦为 32×16 基座 + 旋转，见⑦）；④ 所有 VPTQ 预处理组 GPQA 均落后基线（73.99）约 8.5~11.4 分，k=16 级 VPTQ 预处理在该部署配方下整体为负收益，其正确形态是 Hadamard 旋转前置或端到端部署；⑤ 双尺度归一化被数据否决（通道模量 p99/中位 ≈1.1，分布本已均匀，且与 MSE 相关性 |r|≤0.17）；09-22 全量实测印证——上表 dual-norm 行 GPQA 65.75 / aime 71.67，与未归一化组 65.53/71.11 统计持平（重建 MSE −0.6pp 但 proxy_error +0.15pp，白化抹平 H⁻¹ 利用的通道结构），该线关闭；⑥ **Hadamard 旋转端到端未兑现权重域收益**：rot2 修复版 GPQA 64.54 vs 未旋转 65.53（−1.0，σ=2.04 内）、aime 65.56 vs 71.11（−5.6，但 aime σ=9.35 覆盖）——尽管量化侧 proxy 误差降 35-40%（§8A.4/8A.5 的 860 实例结论在全模型 33,024 矩阵复现）、重建态 MSE 同步下降，任务域成绩却持平甚至略降。教训有二：(a) 权重域 MSE 改善 ≠ 任务域收益，Hadamard 把误差"均摊"到所有通道的同时，也抹平了 H⁻¹ 误差传播原本利用的通道间误差结构（ proxy 目标的优化方向与下游任务损失并不对齐）；(b) **漏转 42 个张量的代价**——首版旋转（未修复 indexer.compressor 内层 wkv/wgate，详见 §8A.5 排障）同配方仅得 GPQA 63.13 / aime 55.56，修复后回升至 64.54/65.56：一个张量类别的旋转遗漏造成 ~1.4 GPQA + ~~~10 aime 的损失，V4-Flash 的 indexer 压缩注意力对输入一致性极度敏感，旋转类方案必须以"残差流全读取点"清单为准（本例共 82 个读取点张量）；⑦ **wrap-around Hadamard（只转专家）是终局答案**：Ŵ=Q(W·R)·Rᵀ（w1/w2/w3 全输入侧，w2 用独立 2048 维 R，Hessian 同步 RᵀHR），模型其余部分逐位不动——GPQA 66.43（15 轮，超未旋转组 +0.90、超 rot2 +1.89）、**aime 73.33（4 轮，超基线 71.67）**，VPTQ 各方案最优。归因链闭合：wrap（只动专家）≫ rot2（专家+注意力全转）⇒ **rot2 的损失来自注意力/残差侧旋转而非专家侧**；专家侧旋转正收益（权重域 rel-MSE −3~9%~~ 在任务域兑现为 GPQA +0.9 / aime +2.2），且部署零开销（R 折入权重内部，推理图与未旋转一致）。实现：`run.py --wrap-rotation` / `rebuild_bf16.py --wrap-rotation` / `hadamard.py: wrap_rotation()`；带符号 Hadamard R 非对称（R⁻¹=Rᵀ），包装必须右乘 Rᵀ。评测侧教训：vLLM 起服初期（health 200 但 worker 未就绪）请求会整轮 500，编排器需真实请求预热探测；⑧ **补采线（floor=1024）收益确认且与旋转线正交**：aime **74.44**（3 轮，超基线 +2.78、超旧 Hessian 组 +3.33、超 wrap 组 +1.11）为全场最高——冷门专家 Hessian 质量是数学推理误差的主杠杆（兑现 §8A.7 的 Spearman -0.914 预测）；GPQA 65.87 与旧组 65.53 持平（补采只改 sub-1024 专家的 H，GPQA 损伤不在该路径）。两条线作用域不同（补采管 Hessian 质量、wrap 管权重几何），**补采+wrap 组合**为下一步（在补采 Hessian 上 `--wrap-rotation` 重跑量化即可）；⑨ **calibR9 线（Hessian-语料对齐）是 GPQA 的决定性杠杆**（上节单变量对照表）：同一 tile32×16 方案仅换 Hessian 数据源（RedPajama→R9tau 评测对齐语料）GPQA 65.53→72.22（**+6.7**，σ=1.3 历史最稳），距基线仅 1.77 分，aime 72.22 反超基线 71.67——补采线（Hessian 质量）、旋转线（权重几何）、双尺度线对 GPQA 均无实质改善，**GPQA 损伤的主因是 Hessian 分布与评测分布失配**；且对齐收益的语料门槛极低（203k token / 49 条即兑现，6 个 0 命中专家单位阵回退亦无碍）。与补采/wrap 的正交叠加（R9tau + 补采 + wrap）为终局组合方向。
 

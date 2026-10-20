@@ -1,0 +1,129 @@
+{
+    "binFileName": "Add_FLOAT32_high_performance",
+    "binFileSuffix": ".o",
+    "blockDim": -1,
+    "coreType": "VectorCore",
+    "core_type": "AIV",
+    "intercoreSync": 0,
+    "kernelName": "Add_FLOAT32_high_performance",
+    "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping": [],
+    "opParaSize": 640,
+    "parameters": [
+        null,
+        null,
+        null,
+        null
+    ],
+    "sha256": "c3017f401a24a1e72683f1863949b21785e8c0b263efae20149ce272bac9666c",
+    "workspace": {
+        "num": 1,
+        "size": [
+            -1
+        ],
+        "type": [
+            0
+        ]
+    },
+    "kernelList": [
+        {
+            "kernelName": "Add_FLOAT32_high_performance_0"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_1"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_2"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_3"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_4"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_5"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_6"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_7"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_8"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_9"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_10"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_11"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_12"
+        },
+        {
+            "kernelName": "Add_FLOAT32_high_performance_13"
+        }
+    ],
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "supportSuperKernel": 1,
+    "compileInfo": {},
+    "supportInfo": {
+        "implMode": "high_performance",
+        "int64Mode": false,
+        "simplifiedKeyMode": 0,
+        "simplifiedKey": [
+            "Add/d=0,p=1/0,2/0,2/0,2",
+            "Add/d=0,p=0/0,2/0,2/0,2",
+            "Add/d=1,p=1/0,2/0,2/0,2",
+            "Add/d=1,p=0/0,2/0,2/0,2"
+        ],
+        "optionalInputMode": "gen_placeholder",
+        "optionalOutputMode": "gen_placeholder",
+        "staticKey": "55e84ffac41fa7325a9f15f74c4d444618458c8c02467f776f20e7d2933e345e,295935613b943d6a71aa3e5b596ee7da1f284cfde70cbf59960f8c546b5d4d30",
+        "inputs": [
+            {
+                "name": "x1",
+                "index": 0,
+                "dtype": "float32",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ],
+                "format_match_mode": "FormatAgnostic"
+            },
+            {
+                "name": "x2",
+                "index": 1,
+                "dtype": "float32",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ],
+                "format_match_mode": "FormatAgnostic"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "index": 0,
+                "dtype": "float32",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ],
+                "format_match_mode": "FormatAgnostic"
+            }
+        ],
+        "opMode": "dynamic",
+        "deterministic": "ignore"
+    }
+}

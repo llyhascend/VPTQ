@@ -5,7 +5,11 @@
 set -u
 cd "$(dirname "$0")"
 
-QUANT=/mnt/share/w00608002/weights/quant/dsv4-tile32x32-rowfp8-fb-calibR9
+# 10-15 修复：必须用 wrap 版量化产物（rf32wfb 的 S3）。曾误用 rf32fb 的
+# dsv4-tile32x32-rowfp8-fb-calibR9（无 wrap），rebuild @Rᵀ 后 28896 个 VPTQ
+# 矩阵全部变成 Q(W)·Rᵀ 乱码 → 夜间评测 0 预测空转。
+QUANT=/mnt/share/w00608002/weights/quant/dsv4-tile32x32-rowfp8-wrap-fb-calibR9
+case "$QUANT" in *wrap*) : ;; *) echo "QUANT 不含 wrap，中止（10-15 事故防再犯）"; exit 1 ;; esac
 CKPT=/mnt/share/w00608002/weights/DeepSeek-V4-Flash-vptq-calibR9-rf32wfb-bf16
 ROTATION=/mnt/share/w00608002/weights/DeepSeek-V4-Flash-BF16-rot2/rotation.safetensors
 BF16=/mnt/share/w00608002/weights/DeepSeek-V4-Flash-vptq-calibR9-rf32wfbfb4-bf16
@@ -44,7 +48,10 @@ s4(){
   done
   a=0
   while true; do
-    [ -f "$BF16/model.safetensors.index.json" ] && break
+    # 10-15 加固：index.json 在 assemble 开头就拷贝（非权重文件先行），
+    # 单看它会误判（昨晚 28/46 事故根因）——必须 46 个 shard 齐全
+    n_shards=$(ls "$BF16"/model-*.safetensors 2>/dev/null | wc -l)
+    [ "$n_shards" -ge 46 ] && break
     if ! pgrep -f "rebuild_bf1[6]" >/dev/null; then
       a=$((a+1)); [ $a -gt 40 ] && { log "S4 组装重试耗尽"; return 1; }
       log "S4 assemble attempt=$a"
