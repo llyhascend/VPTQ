@@ -14,8 +14,9 @@ class QuantConfig:
     Mirrors the VQuantLinear constructor semantics:
       - weight columns (input channels) are quantized one at a time,
         each column split into vectors of `vector_len`;
-      - columns are divided into `group_num` groups along in_features,
-        each group owning a codebook of `num_centroids` centroids;
+      - columns are cut into `col_tile`-wide blocks along in_features
+        (number of groups = in_features // col_tile; 0 = whole-row single
+        group), each block owning a codebook of `num_centroids` centroids;
       - optional residual VQ stage with `num_res_centroids` centroids
         (-1 disables);
       - optional outlier separation / act-order permutation / per-channel
@@ -25,7 +26,7 @@ class QuantConfig:
     vector_len: int = 8
     num_centroids: int = 65536
     num_res_centroids: int = -1  # -1: no residual VQ
-    group_num: int = 1
+    col_tile: int = 0  # column-block width; groups = in_f // col_tile
     outlier_size: int = 0  # input channels pulled out by top diag(H)
     outlier_vector_len: int = 4
     num_outlier_centroids: int = 256
@@ -39,7 +40,7 @@ class QuantConfig:
     # --- extended scheme (tile grouping / decoupled residual vector) ---
     res_vector_len: int = 0  # 0: same as vector_len; >0: residual v
     row_tile: int = 0  # 0: full-column groups; >0: 2D tiles of
-    # (in/group_num cols) x (row_tile rows), one codebook per tile
+    # col_tile cols x row_tile rows, one codebook per tile
     centroid_fp8: bool = False  # store centroids as fp8 (8bit/elem)
 
     @property
@@ -90,7 +91,7 @@ class QuantConfig:
         """2.03125 bit/elem (2.65625 with residual): v=2, K=16 (4bit),
         residual vectors span 4 main vectors (v_res=8), K_res=16,
         meant for 32-col x 256-row tiles with fp8 centroids.
-        Set group_num = in_features // 32 and row_tile=256 at call site."""
+        Set col_tile = 32 and row_tile=256 at call site."""
         return QuantConfig(
             vector_len=2,
             num_centroids=16,

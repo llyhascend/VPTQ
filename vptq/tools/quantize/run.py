@@ -445,14 +445,28 @@ def main():
     p.add_argument("--vector-len", type=int, default=8)
     p.add_argument("--num-centroids", type=int, default=65536)
     p.add_argument("--num-res-centroids", type=int, default=-1)
-    p.add_argument("--group-num", type=int, default=1)
+    p.add_argument(
+        "--col-tile",
+        type=int,
+        default=0,
+        help="column-block width; groups = in_f // col_tile, so w1/w3 "
+        "(in_f=4096) and w2 (in_f=2048) share the same tile geometry "
+        "(e.g. 32 -> 32x32 tiles with --row-tile 32). 0: whole-row "
+        "single group.",
+    )
+    p.add_argument(
+        "--group-num",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,  # deprecated alias: col_tile = 4096/group
+    )
     p.add_argument("--kmeans-iters", type=int, default=10)
     p.add_argument(
         "--row-tile",
         type=int,
         default=0,
         help="0: full-column groups; >0: 2D tiles of "
-        "(in/group_num cols) x (row_tile rows), one codebook per tile "
+        "col_tile cols x (row_tile rows), one codebook per tile "
         "(tile scheme, see QuantConfig.row_tile).",
     )
     p.add_argument(
@@ -527,11 +541,20 @@ def main():
     if args.rotation and args.wrap_rotation:
         raise ValueError("--rotation and --wrap-rotation are mutually exclusive")
 
+    if args.group_num is not None:
+        if args.col_tile:
+            raise ValueError("--group-num is deprecated; use --col-tile only")
+        args.col_tile = max(1, 4096 // args.group_num)
+        logger.warning(
+            "--group-num %d deprecated -> --col-tile %d "
+            "(groups per matrix = in_f // col_tile)",
+            args.group_num, args.col_tile,
+        )
     config = QuantConfig(
         vector_len=args.vector_len,
         num_centroids=args.num_centroids,
         num_res_centroids=args.num_res_centroids,
-        group_num=args.group_num,
+        col_tile=args.col_tile,
         kmeans_iters=args.kmeans_iters,
         res_vector_len=args.res_vector_len,
         row_tile=args.row_tile,
@@ -644,7 +667,10 @@ def main():
         "vector_len": config.vector_len,
         "num_centroids": config.num_centroids,
         "num_res_centroids": config.num_res_centroids,
-        "group_num": config.group_num,
+        "col_tile": config.col_tile,
+        "col_tile_note": ("groups per matrix = in_f // col_tile "
+                          "(same tile geometry for w1/w2/w3), see "
+                          "vq._num_col_groups"),
         "bits_per_weight": config.bits_per_weight,
     }
     with open(report_path, "w") as f:

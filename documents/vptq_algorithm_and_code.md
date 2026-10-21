@@ -408,8 +408,10 @@ GEMV kernel 按 `IDXBITS/ResidualBits/GROUPSIZE` 模板特化（`csrc/quant_gemv
 | VPTQ 32×16 + calibR9 + dual-norm + row-fp8 | R9tau（同上） | 2.50 bit | 74.24/71.21/69.70（**71.72**，σ≈2.3） | 73.33/66.67/73.33（**71.11**，σ=3.9） |
 | VPTQ 32×32 + calibR9 + wrap + row-fp8 + 12.5% 专家回退<br>（rf32wfb-**fb4**：回退专家改 wrap 域 mxfp4 预量化）<br>+ vptq直通&moeW8A8 | R9tau（同上） | ~2.50 bit（2.25×87.5% + 4.25×12.5%；<br>部署统一 8bit 直通存储） | 73.74/75.25/69.70/69.70/69.70<br>（**71.62**，σ≈2.7） | 73.33/76.67/66.67/83.33/76.67<br>（**75.33**，σ≈6.1） |
 | attnw8a8ceil + moe-scale1（原始 ckpt 路由专家<br>W8A8 直通，无 VPTQ，**基线2**） | —（ModelSlim 直量化，无 VPTQ） | 8 bit | 73.74/70.20/70.71/74.24/72.73<br>（**72.32**，σ≈1.8） | 63.33/70.00/66.67/70.00/70.00<br>（**68.00**，σ≈3.0） |
+| VPTQ 32×32 + calibR9 + wrap + row-fp8 + 12.5% 专家回退<br>（rf32wfb-**ct32**：col_tile 直配，w2 与 w1/w3 统一 32×32 tile<br>即 w2 组数 128→64、码本摊销 0.5→0.25bit）<br>+ 回退 wrap 域 mxfp4 预量化 + vptq直通&moeW8A8 | R9tau（同上） | ~2.33 bit 参数加权<br>（w1/w3 2.25 + w2 2.25；部署 8bit 直通） | 71.21/68.18/70.71/71.72/70.71<br>（**70.51**，σ≈1.4） | 73.33/76.67/73.33/66.67/83.33<br>（**74.67**，σ≈6.1） |
 
 注：数值列为逐轮分数（均值，σ=样本标准差，历史缺 σ 组本轮补算以 ≈ 标注）；~2.50 bit = 2.25×87.5% + 4.25×12.5%（VPTQ 专家 2.25 bit + 回退 mxfp4 4.25 bit）。
+
 
 **各实验组权重与配置目录**（权重前缀 `/mnt/share/w00608002/weights/`，yaml 前缀 `/mnt/share/w00608002/msmodelslim/deepseek-v4-flash-`；无 VPTQ 组直接量化原始 ckpt `/mnt/share/weight/DeepSeek-V4-Flash-BF16`）
 
@@ -426,6 +428,7 @@ GEMV kernel 按 `IDXBITS/ResidualBits/GROUPSIZE` 模板特化（`csrc/quant_gemv
 | 9 | 32×16 + calibR9 + dual-norm + row-fp8 | dsv4-tile32x16-dn-rowfp8-calibR9 | vptq-calibR9-dnrowfp8-bf16 | vptq-calibR9-dnrowfp8-attnw8a8-moew4a8 | 同 #1 |
 | 10 | fb4（rf32wfb + 回退改 wrap 域 mxfp4） | 同 #8（expert_parts/ 含回退 mxfp4 parts） | vptq-calibR9-rf32wfbfb4-bf16 | vptq-calibR9-rf32wfbfb4-attnw8a8-moew8a8 | attenw8a8-vptqw8a8scale1-moew8a8.yaml |
 | 11 | attnw8a8ceil + moe-scale1 基线2 | — | — | attnw8a8ceil-moescale1 | attnw8a8ceil-moescale1.yaml |
+| 12 | ct32（rf32wfb + col_tile 统一 32×32 tile） | dsv4-ct32x32-rowfp8-wrap-fb-calibR9 | vptq-calibR9-rf32wfbct32-bf16 | vptq-calibR9-rf32wfbct32-attnw8a8-moew8a8 | 同 #10 |
 
 注：QUANT 目录为 VPTQ 量化产物（`.pt` + `.parts/`），重建 BF16 为 `rebuild_bf16.py` 反量化装配后的全精度检查点，部署权重为 msmodelslim 按 yaml 产出的最终量化目录；#5 回退组与 #4 共用 quant 基座（回退专家不走 VPTQ，名单在 `fallback_list.json`），#10 fb4 与 #8 共用 wrap quant 基座（差异在重建阶段回退 parts 的 mxfp4 预量化与部署 yaml 的 scale_one 直通）。
 
@@ -438,6 +441,7 @@ calibR9 采集为严格基线口径（无 token-floor、无 save-inv、128×4096
 3. **回退轴**（第 4 vs 5 行）：12.5% gate 分数回退（专家分数 = sum(激活时 gate 分数) 降序：688 整专家 + 2064 down 层 = 4128 矩阵；`gate_scores.py`/`fallback_list.py`/`rebuild_bf16.py --fallback-list`，回退专家走 msmodelslim 标准 W4A8）→ GPQA **+2.4**（68.31→70.71）——排序依据从权重域 MSE（② 的 top20 无效）换成路由域 gate 分数后回退首次兑现；但同位宽下仍不敌 tile 密度（70.71 < 72.22），且对 aime 无增益（gate 高分偏高频通用专家，数学冷门专家未覆盖；混合准则 gate×冷门度是改进方向）。
 4. **FP8 域归一化 + 双尺度叠加轴**（第 3 vs 6 行，同 tile32×16）：量化前 out-dim 行峰对齐 e4m3 满量程 448（`run.py --row-fp8`，复合 row_scale=rms/fp8 折回，恒等性 1.5e-08）叠加 dual-norm → GPQA 71.72 / aime 71.11，与纯 tile16+calibR9（72.22/72.22）统计持平——**无损叠加但无净增益**：单轮 74.24 为 VPTQ 组历史首个超基线（73.99）轮次，证明 FP8 域对动态范围利用的改善真实存在，却被 dual-norm 的白化中性化抵消（⑤ 的教训再现）。**纯 row-fp8（不带 dual-norm）的隔离数据点已补**（rf32fb，第 5b 行，t32×32 基座 + 12.5% 回退同配置对照）：GPQA 71.89（单轮 75.25 与基线最高轮持平）/ aime 64.44——vs 同基座无 row-fp8（70.54/61.11）**GPQA +1.35、aime +3.33，row-fp8 单独贡献为正**；同位宽 GPQA 追平 32×16 系（72.22/71.72）但 aime 仍落后 7~8 分，tile 密度代价在 aime 上依旧成立。
 5. **回退域 mxfp4 预量化 + 统一 W8A8 直通轴**（rf32wfb→fb4，2026-10-16~17，第 9 vs 10 行）：回退专家从"msmodelslim 标准 W4A8"改为 **wrap 域 mxfp4 预量化**——`rebuild_bf16.py --fallback-mxfp4` 生成 part = mxfp4_ceilx_roundtrip(W·R, 7.25)·Rᵀ（R 为与 VPTQ 专家相同的分块对角 Hadamard block=32/seed=0，磁盘 part 对拍 rel=0.000000 逐位一致；原权重本在 mxfp4 网格上，wrap 引入 ~11.3% 表示误差为知情决策），部署侧 yaml 单规则 `*ffn.experts*` scale_one 直通 cast e4m3，路由专家（VPTQ 2bit 重建 + 回退 mxfp4 预量化）统一 8bit 存储 → GPQA 71.62（vs rf32wfb 71.38，+0.24 噪声内）、**aime 75.33 为全表最高**（vs 68.89，+6.44，σ≈6.1 方差内偏好）；同 W8A8 直通部署下对照基线2（原始 ckpt + moe-scale1，无 VPTQ）：GPQA 71.62 vs 72.32（−0.7 噪声内）、aime 75.33 vs 68.00（+7.33）——**VPTQ 2bit 重建专家在任务域追平无 VPTQ 直通基线**，结论④"k=16 级 VPTQ 预处理整体负收益"在 wrap + calibR9 + 回退 + W8A8 直通组合下不再成立。评测链路：`day_chain_fb4_base.sh`（assemble→部署→真实性验证→评测全自动，killer 自愈）；排障记录：killer 杀 vllm 后 `/dev/shm` psm_* 段泄漏致 64MB tmpfs 打满 → 后续实例并发请求整轮 500（预热单请求可过），`ensure_vllm` 已加死段自动清理。
+6. **tile 几何统一轴**（fb4→ct32，2026-10-20~21，第 11 vs 12 行）：`config.group_num`（全局组数，w2 in_f=2048 下 tile 退化为 32×16、码本摊销翻倍 0.5bit）重构为 `config.col_tile`（**列宽直配**：组数 = in_f//col_tile，w1/w2/w3 统一 32×32 tile，w2 摊销 0.5→0.25bit、参数加权位宽 2.33→2.25）；CLI 换 `--col-tile 32`（`--group-num` 留 deprecated 别名自动换算），重建侧按 `in_f // indices.shape[1]` 自推断组数（新旧产物 cols=32/16 双兼容，`tests/test_uniform_tile.py` 4 项 + 量化回归 4 项全绿）。端到端同配置重跑（`day_chain_ct32_base.sh`）：GPQA 70.51（σ≈1.4）/ aime 74.67（σ≈6.1）vs fb4 71.62（σ≈2.7）/ 75.33（σ≈6.1）——**统计持平（差异均在 σ 内，ct32 的 GPQA σ 反而最小）**：w2 组数减半（每码本覆盖参数翻倍）的精度代价未在任务域显现，且省 0.08bit/权重（全专家位宽统一 2.25）。
 
 报告：`ais_bench_logs/vptq-calibR9-tile16-attnw8a8-moew4a8-20260923/`、`vptq-calibR9-t32x32fb-20260925/`、`vptq-calibR9-t32x32fb-extra7-20260928/`（回退组 GPQA 并至 6 轮 70.54）、`vptq-calibR9-dnrowfp8-20260929/`、`vptq-calibR9-rf32fb-attnw8a8-moew4a8-20261009/`（rf32fb 修复折回 bug 后重跑，见 §8A.7b'）、`benchmark/outputs/default/2026101{6,7}_*`（fb4 与基线2 各 5+5 轮，2026-10-16~17）。
 

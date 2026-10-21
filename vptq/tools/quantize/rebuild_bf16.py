@@ -65,14 +65,19 @@ def reconstruct_weight(qw, group_num: int, row_tile: int, device) -> torch.Tenso
         idx = idx.long().to(device)
         T, cols, nvec = idx.shape
         k, v = cents.shape[1], cents.shape[2]
+        # group_num is the per-matrix column-group count: with col_tile
+        # (2026-10-20) w2 (in_f=2048) stores 64 32-wide groups vs 128 for
+        # w1/w3; the caller passes in_f // cols so old artifacts (16-wide
+        # groups) read back correctly too.
+        gnum = group_num
         flat = cents.reshape(T * k, v)
         off = torch.arange(T, device=device).view(-1, 1, 1) * k
         g = flat[(idx + off).reshape(-1)].view(T, cols, nvec, v)
         g = g.permute(0, 2, 3, 1).reshape(T, nvec * v, cols)  # (T, span, cols)
-        n_row = T // group_num
-        g = g.view(group_num, n_row, nvec * v, cols)
-        g = g.permute(1, 2, 0, 3)  # (n_row, span, group_num, cols)
-        return g.reshape(n_row * (nvec * v), group_num * cols)
+        n_row = T // gnum
+        g = g.view(gnum, n_row, nvec * v, cols)
+        g = g.permute(1, 2, 0, 3)  # (n_row, span, gnum, cols)
+        return g.reshape(n_row * (nvec * v), gnum * cols)
 
     Q = expand(qw.centroids, qw.indices)
     if qw.res_centroids is not None:
@@ -148,10 +153,12 @@ def pass_rebuild(args):
             )
             if os.path.exists(out_path):
                 continue
-            Q = reconstruct_weight(
-                qw, args.group_num, args.row_tile, device
-            )
             out_f, in_f = wmap_shape(args.ckpt, wmap, full)
+            # per-matrix group count, self-describing from stored shapes:
+            # cols = in_f / groups (32 for col_tile runs, 16 for legacy
+            # w2 artifacts quantized under the global --group-num 128)
+            gnum = in_f // qw.indices.shape[1]
+            Q = reconstruct_weight(qw, gnum, args.row_tile, device)
             Q = Q[:out_f]
             # dual-scale normalization: multiply the stored scales back
             # (W_norm = W / s / d was quantized; here Ŵ = s ⊙ Q ⊙ d).
@@ -285,7 +292,11 @@ def main():
     p.add_argument("--ckpt", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--layer-range", default="0:43")
-    p.add_argument("--group-num", type=int, default=128)
+    p.add_argument(
+        "--group-num", type=int, default=128,
+        help="deprecated/unused: group count is inferred from "
+        "centroids.shape[0] (per-matrix since col_tile, 2026-10-20)",
+    )
     p.add_argument("--row-tile", type=int, default=256)
     p.add_argument("--device", default="npu")
     p.add_argument("--assemble", action="store_true")
