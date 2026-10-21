@@ -186,15 +186,23 @@ def collect(
 ):
     was_training = model.training
     model.eval()
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
+    # KV cache 全程无用；text_config 与顶层 config 是两份配置，都关掉
+    for cfg in (getattr(model.config, "text_config", None), model.config):
+        if cfg is not None and hasattr(cfg, "use_cache"):
+            cfg.use_cache = False
     try:
         input_device = model.get_input_embeddings().weight.device
     except AttributeError:
         input_device = next(model.parameters()).device
+    # 只跑 text backbone，不进 lm_head：ForConditionalGeneration 的完整
+    # forward 会对全部位置算 logits (4, 4096, 248320) bf16 ≈ 7.6GB，再被
+    # accelerate 的 post-forward hook 搬回输入卡 —— shard 8:16 正是这笔
+    # 7.58GiB 分配把 NPU 0 顶爆的；Hessian 采集用不到 logits。
+    inner = getattr(model, "model", model)
+    text_model = getattr(inner, "language_model", inner)
     for start in range(0, samples.shape[0], batch_size):
         ids = samples[start : start + batch_size].to(input_device)
-        model(input_ids=ids)
+        text_model(input_ids=ids)
         done = min(start + batch_size, samples.shape[0])
         logger.info("processed %d/%d samples", done, samples.shape[0])
     if was_training:

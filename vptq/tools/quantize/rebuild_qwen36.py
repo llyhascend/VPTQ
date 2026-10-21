@@ -29,6 +29,7 @@ import os
 import torch
 from safetensors.torch import save_file
 
+from vptq.tools.quantize.hadamard import wrap_rotation
 from vptq.tools.quantize.rebuild_bf16 import (
     load_layer_quant,
     pass_assemble,
@@ -68,8 +69,37 @@ def _fold_scales(qw, Q, out_f, in_f):
     return Q
 
 
+def _wrap_back(qw, Q, in_f, cli_wrap):
+    """Undo --wrap-rotation: stored weight is Q(W @ R) in the rotated
+    input basis; multiply back with R^T (signed Hadamard R is orthogonal
+    but NOT symmetric). The artifact's own wrap flag wins; the CLI flag
+    only covers old artifacts written before the field existed.
+    """
+    w = getattr(qw, "wrap", None)
+    if not (cli_wrap if w is None else w):
+        return Q
+    R = wrap_rotation(in_f)
+    return (Q.float() @ R.t().to(Q.device)).to(Q.dtype)
+
+
 @torch.no_grad()
 def pass_rebuild_qwen(args):
+    def geom(qw):
+        """Per-matrix tile geometry: trust the artifact, fall back to CLI.
+
+        Newer QuantizedWeights carry the group_num/row_tile they were
+        quantized with (possibly per-matrix, e.g. down's own group_num);
+        old artifacts lack the fields (getattr -> None) and use the CLI.
+        row_tile=0 (no tiling) is a legitimate stored value, so only
+        None falls back — `or` would clobber it.
+        """
+        g = getattr(qw, "group_num", None)
+        r = getattr(qw, "row_tile", None)
+        return (
+            g if g else args.group_num,
+            args.row_tile if r is None else r,
+        )
+
     with open(os.path.join(args.ckpt, "model.safetensors.index.json")) as f:
         wmap = json.load(f)["weight_map"]
     prefix = detect_layer_prefix(wmap)
@@ -98,23 +128,24 @@ def pass_rebuild_qwen(args):
         down = torch.empty(n_experts, dn_out, inter, dtype=torch.float32)
         for e in range(n_experts):
             qg = reconstruct_weight(
-                quant[f"experts.{e}.gate"],
-                args.group_num,
-                args.row_tile,
-                device,
+                quant[f"experts.{e}.gate"], *geom(quant[f"experts.{e}.gate"]), device
             )
             qu = reconstruct_weight(
-                quant[f"experts.{e}.up"], args.group_num, args.row_tile, device
+                quant[f"experts.{e}.up"], *geom(quant[f"experts.{e}.up"]), device
             )
             qd = reconstruct_weight(
                 quant[f"experts.{e}.down"],
-                args.group_num,
-                args.row_tile,
+                *geom(quant[f"experts.{e}.down"]),
                 device,
             )
             qg = _fold_scales(quant[f"experts.{e}.gate"], qg, inter, hidden)
             qu = _fold_scales(quant[f"experts.{e}.up"], qu, inter, hidden)
             qd = _fold_scales(quant[f"experts.{e}.down"], qd, hidden, inter)
+            # wrap-rotation 转回在 scale 折回之后：col_scale 是旋转基下的
+            # 对角缩放，不能穿过 R^T
+            qg = _wrap_back(quant[f"experts.{e}.gate"], qg, hidden, args.wrap_rotation)
+            qu = _wrap_back(quant[f"experts.{e}.up"], qu, hidden, args.wrap_rotation)
+            qd = _wrap_back(quant[f"experts.{e}.down"], qd, inter, args.wrap_rotation)
             # 行序即 Qwen3_5MoeExperts.forward 的 chunk 顺序：[0:inter]=gate
             gate_up[e] = torch.cat([qg[:inter], qu[:inter]], 0).float()
             down[e] = qd[:hidden].float()
@@ -139,6 +170,14 @@ def main():
     p.add_argument("--group-num", type=int, default=128)
     p.add_argument("--row-tile", type=int, default=256)
     p.add_argument("--device", default="npu")
+    p.add_argument(
+        "--wrap-rotation",
+        action="store_true",
+        help="Rotate Q(W @ R) weights back with @ R^T (run_qwen36 "
+        "--wrap-rotation). Only needed for old artifacts written "
+        "before the per-matrix wrap flag; newer artifacts "
+        "self-describe and rotate back automatically.",
+    )
     p.add_argument("--assemble", action="store_true")
     args = p.parse_args()
     args.parts_dir = os.path.join(args.output_dir, "expert_parts")

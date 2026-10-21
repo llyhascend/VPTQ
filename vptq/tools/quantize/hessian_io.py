@@ -174,9 +174,14 @@ class HessianStore:
             )
             return torch.eye(n), None
         H, inv = entry["hessian"], entry.get("inv_hessian")
-        if self.R is not None and is_rotated_group(group_key, wrap=self.wrap):
+        # wrap 模式可以不依赖 rotation 文件：R 一律按输入维派生
+        # (wrap_rotation(dim, seed=0)，跨进程逐位一致)。DSV4 的 wrap 走
+        # 文件 R 校验路径（self.R 非 None），行为不变。
+        if (
+            self.R is not None or self.wrap
+        ) and is_rotated_group(group_key, wrap=self.wrap):
             R = self.R
-            if self.wrap and H.shape[-1] != R.shape[0]:
+            if self.wrap and (R is None or H.shape[-1] != R.shape[0]):
                 # wrap mode: per-input-dim rotation (w2's 2048-d SwiGLU
                 # intermediate gets its own Hadamard; seed-0 4096 matches
                 # the rotation file's global_rotation).

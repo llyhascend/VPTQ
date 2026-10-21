@@ -44,6 +44,19 @@ class QuantizedWeight:
     # multiplies them back (row left, col right). None = not normalized.
     row_scale: Optional[torch.Tensor] = None  # (out,) rms per row
     col_scale: Optional[torch.Tensor] = None  # (in,) rms per column
+    # tile geometry this weight was quantized with (self-describing
+    # artifact): rebuild reads these per matrix instead of trusting CLI
+    # flags, so per-matrix configs (e.g. down's own group_num) and
+    # step2/step3 flag mismatches are both handled. Absent in older
+    # artifacts — readers fall back to CLI via getattr.
+    group_num: int = 1
+    row_tile: int = 0
+    # wrap-rotation self-description: this weight was quantized as
+    # V = W @ R (R = wrap_rotation(in), seed-0 signed Hadamard), so
+    # rebuild must rotate back with Q @ R^T (R is orthogonal, not
+    # symmetric). False for unwrapped weights; absent in older
+    # artifacts — readers fall back to CLI via getattr.
+    wrap: bool = False
 
 
 @torch.no_grad()
@@ -712,6 +725,8 @@ def vptq_quantize(
         ),
         proxy_error=proxy.item(),
         mse=mse.item(),
+        group_num=config.group_num,
+        row_tile=config.row_tile,
     )
 
 
@@ -834,6 +849,8 @@ def vptq_quantize_joint(
                 ),
                 proxy_error=proxy.item(),
                 mse=mse.item(),
+                group_num=config.group_num,
+                row_tile=config.row_tile,
             )
         )
     return outs

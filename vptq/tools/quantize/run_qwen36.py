@@ -37,10 +37,12 @@ import argparse
 import json
 import logging
 import os
+from dataclasses import replace
 
 import torch
 
 from vptq.tools.quantize.config import QuantConfig
+from vptq.tools.quantize.hadamard import right_rot, wrap_rotation
 from vptq.tools.quantize.hessian_io import HessianStore
 from vptq.tools.quantize.run import PartsStaging, WeightStore
 from vptq.tools.quantize.vq import (
@@ -80,11 +82,24 @@ def quantize_expert(
     down_e: torch.Tensor,
     store: HessianStore,
     config: QuantConfig,
+    down_config: QuantConfig,
     device: torch.device,
+    wrap: bool = False,
 ) -> dict:
     """Quantize one expert -> {short: QuantizedWeight}.
 
     gate_up_e: (2*inter, hidden); down_e: (hidden, inter).
+
+    gate/up share `config` (same shape, same mlp_in Hessian, one batched
+    kmeans); down is quantized with `down_config`, which may override
+    group_num/row_tile to compensate for its smaller in_features.
+
+    wrap=True (--wrap-rotation): every matrix is input-side wrapped —
+    quantize V = W @ R with R = wrap_rotation(in) (seed-0 signed
+    Hadamard; the store rotates H/inv to R^T H R in step) — and the
+    QuantizedWeight.wrap flag tells rebuild to rotate back with
+    Q @ R^T. Deployment stays in the original basis; the rotation only
+    Gaussianizes what the VQ codebooks see.
     """
     inter = gate_up_e.shape[0] // 2
     hess_key_in = f"mlp.experts.{e}.mlp_in"
@@ -94,6 +109,11 @@ def quantize_expert(
     # （与 run.py 的 w1+w3 joint 同构，vptq_quantize_joint 要求同形状）
     Wg = gate_up_e[:inter].float()
     Wu = gate_up_e[inter:].float()
+    Wd = down_e.float()
+    if wrap:
+        Wg = right_rot(Wg, wrap_rotation(gate_up_e.shape[1]))
+        Wu = right_rot(Wu, wrap_rotation(gate_up_e.shape[1]))
+        Wd = right_rot(Wd, wrap_rotation(Wd.shape[1]))
     hessian_in, _ = store.get(layer_idx, hess_key_in)
     HinvU_in = store.cholesky_upper(layer_idx, hess_key_in, damp=config.damp)
     qw_g, qw_u = vptq_quantize_joint(
@@ -115,13 +135,14 @@ def quantize_expert(
     out[f"experts.{e}.gate"] = qw_g
     out[f"experts.{e}.up"] = qw_u
 
-    Wd = down_e.float()
     hessian_dn, _ = store.get(layer_idx, hess_key_dn)
-    HinvU_dn = store.cholesky_upper(layer_idx, hess_key_dn, damp=config.damp)
+    HinvU_dn = store.cholesky_upper(
+        layer_idx, hess_key_dn, damp=down_config.damp
+    )
     qw_d = vptq_quantize(
         Wd,
         hessian_dn.float(),
-        config,
+        down_config,
         device=device,
         hessian_inv_upper=HinvU_dn,
         kmeans_seed=hash(f"layers.{layer_idx}.experts.{e}.down") & 0xFFFF,
@@ -135,6 +156,10 @@ def quantize_expert(
         qw_d.mse,
     )
     out[f"experts.{e}.down"] = qw_d
+    if wrap:
+        # 自描述：rebuild 按 per-matrix 标志转回，混合/续跑产物也不会错配
+        for qw in out.values():
+            qw.wrap = True
     return out
 
 
@@ -172,6 +197,34 @@ def main():
         default=None,
         help="Local NVMe dir to stage quant parts (perf on NFS).",
     )
+    p.add_argument(
+        "--down-group-num",
+        type=int,
+        default=None,
+        help="Column-group override for down_proj. Its in_features is "
+        "moe_intermediate (512), so the same --group-num yields 4-col "
+        "tiles vs gate/up's 16-col and 4x codebook amortization; pass "
+        "e.g. 32 to align column width (512/32 = 16). Default: same "
+        "as --group-num.",
+    )
+    p.add_argument(
+        "--down-row-tile",
+        type=int,
+        default=None,
+        help="Row-tile override for down_proj. Default: same as "
+        "--row-tile.",
+    )
+    p.add_argument(
+        "--wrap-rotation",
+        action="store_true",
+        help="Quantize every matrix as V = W @ R (R = wrap_rotation(in), "
+        "seed-0 signed Hadamard; Hessians rotated to R^T H R in the "
+        "store). Spreads outliers so the tiny VQ codebooks fit better; "
+        "rebuild_qwen36 --wrap-rotation rotates back with Q @ R^T. "
+        "Deployment weights stay in the original basis. QuantizedWeight."
+        "wrap records it per matrix, so rebuild stays correct even for "
+        "mixed/resumed artifacts.",
+    )
     args = p.parse_args()
 
     config = QuantConfig(
@@ -185,6 +238,26 @@ def main():
         centroid_fp8=args.centroid_fp8,
     )
     logger.info("config: %s (%.3f bits/weight)", config, config.bits_per_weight)
+    down_config = config
+    if args.down_group_num is not None or args.down_row_tile is not None:
+        down_config = replace(
+            config,
+            group_num=(
+                args.down_group_num
+                if args.down_group_num is not None
+                else config.group_num
+            ),
+            row_tile=(
+                args.down_row_tile
+                if args.down_row_tile is not None
+                else config.row_tile
+            ),
+        )
+        logger.info(
+            "down config: %s (%.3f bits/weight)",
+            down_config,
+            down_config.bits_per_weight,
+        )
     device = torch.device(args.device)
 
     def identity_dims(group_key: str) -> int:
@@ -196,7 +269,18 @@ def main():
 
     weights = WeightStore(args.ckpt)
     prefix = detect_layer_prefix(weights.weight_map)
-    store = HessianStore(args.hessian_dir, identity_dims=identity_dims)
+    store = HessianStore(
+        args.hessian_dir,
+        wrap=args.wrap_rotation,
+        identity_dims=identity_dims,
+    )
+    if args.wrap_rotation:
+        logger.info(
+            "wrap-rotation ON: W -> W @ R per input dim "
+            "(hidden=%d via mlp_in, inter=%d via down_proj)",
+            args.hidden_size,
+            args.moe_intermediate,
+        )
     staging = None
     if args.save_staging:
         staging = PartsStaging(args.save_staging)
@@ -267,7 +351,9 @@ def main():
                 down[e],
                 store,
                 config,
+                down_config,
                 device,
+                wrap=args.wrap_rotation,
             )
             out.update(new)
             for s, qw in new.items():
@@ -304,7 +390,11 @@ def main():
         "num_centroids": config.num_centroids,
         "num_res_centroids": config.num_res_centroids,
         "group_num": config.group_num,
+        "row_tile": config.row_tile,
         "bits_per_weight": config.bits_per_weight,
+        "down_group_num": down_config.group_num,
+        "down_row_tile": down_config.row_tile,
+        "wrap_rotation": args.wrap_rotation,
         "model": "qwen3_5_moe-packed-experts",
     }
     with open(report_path, "w") as f:

@@ -37,9 +37,17 @@ export MALLOC_ARENA_MAX=4
 CKPT=/home/l50062354/models/Qwen3.6-35B-A3B
 CALIB_DATA=/home/l50062354/datasets/calib_corpus_R9tau.jsonl
 BASE=/home/l50062354/vptq_qwen36
-HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt
-QUANT_DIR=$BASE/quant-tile32x16    # Step2 产物: quant_layer_XXXX_e*_e*.pt
-OUT_DIR=$BASE/hf-vptq-tile32x16-bf16  # Step3 产物: 可部署 checkpoint 副本
+
+# wrap-rotation（QuaRot 式预旋转）：量化 W@R（seed-0 符号 Hadamard，
+# Hessian 同步 R^T H R），重建时 @R^T 转回原坐标，部署侧无感。开关
+# 会切换产物目录后缀——不同方案不共用 .parts，避免续跑混产物。
+WRAP_ROTATION=1
+WRAP_TAG=""; [ "$WRAP_ROTATION" -eq 1 ] && WRAP_TAG="-wrap"
+WRAP_FLAG=""; [ "$WRAP_ROTATION" -eq 1 ] && WRAP_FLAG="--wrap-rotation"
+
+HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt（与旋转无关，两方案共用）
+QUANT_DIR=$BASE/quant-tile32x32$WRAP_TAG    # Step2 产物: quant_layer_XXXX_e*_e*.pt
+OUT_DIR=$BASE/hf-vptq-tile32x32$WRAP_TAG-bf16  # Step3 产物: 可部署 checkpoint 副本
 
 N_LAYERS=40                        # text_config.num_hidden_layers
 N_EXPERTS=256                      # text_config.num_experts
@@ -93,8 +101,14 @@ fi
 
 # =============================================================================
 # Step 2: 量化（4 卡并行，每卡 64 专家 × 40 层）
-#   tile 方案 ≈2.66bit/权重；产物 quant_layer_XXXX_e{e0}_{e1}.pt +
-#   quant_report.json（proxy_error 为质量首要指标）
+#   tile 方案（2026-10-21 起列宽对齐）: 全部矩阵 32列×32行 tile，码本摊销
+#   0.25 bit/权重 + 索引 2.0 = 2.25 bit/权重
+#   （gate/up g=64 → 2048/64=32 列宽；down g=16 → 512/16=32 列宽，
+#     消除 down 的 4 倍摊销差）
+#   WRAP_ROTATION=1 时叠加 --wrap-rotation：量化 W@R（Hadamard 高斯化，
+#   Hessian 同步旋转），rebuild @R^T 转回，部署权重坐标不变
+#   产物 quant_layer_XXXX_e{e0}_{e1}.pt + quant_report.json
+#   （proxy_error 为质量首要指标）
 # =============================================================================
 if [ "$DO_STEP2" -eq 1 ]; then
     mkdir -p "$QUANT_DIR"
@@ -107,7 +121,8 @@ if [ "$DO_STEP2" -eq 1 ]; then
             --hessian-dir "$HESS_DIR" \
             --output-dir "$QUANT_DIR" \
             --vector-len 2 --num-centroids 16 --num-res-centroids -1 \
-            --row-tile 16 --centroid-fp8 --group-num 128 --kmeans-iters 5 \
+            --row-tile 32 --centroid-fp8 --group-num 64 --down-group-num 16 \
+            --kmeans-iters 5 $WRAP_FLAG \
             --device npu --layer-range "0:$N_LAYERS" \
             --expert-range "$e0:$e1" \
             --hidden-size 2048 --moe-intermediate 512 \
@@ -129,11 +144,12 @@ if [ "$DO_STEP3" -eq 1 ]; then
     echo "[step3] pass1: rebuild 打包 3D 权重..."
     python3 -m vptq.tools.quantize.rebuild_qwen36 \
         --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
-        --layer-range "0:$N_LAYERS" --group-num 128 --row-tile 16 --device npu
+        --layer-range "0:$N_LAYERS" --group-num 64 --row-tile 32 \
+        $WRAP_FLAG --device npu
     echo "[step3] pass2: assemble 装配部署权重..."
     python3 -m vptq.tools.quantize.rebuild_qwen36 \
         --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
-        --layer-range "0:$N_LAYERS" --group-num 128 --row-tile 16 --device npu \
+        --layer-range "0:$N_LAYERS" --group-num 64 --row-tile 32 --device npu \
         --assemble
     echo "[step3] 全部完成: $OUT_DIR"
 fi
