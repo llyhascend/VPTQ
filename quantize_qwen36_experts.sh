@@ -31,12 +31,13 @@ set -euo pipefail
 cd /home/l50062354/VPTQ-qwen36   # python -m vptq 依赖仓库根目录
 
 # ----------------------------- 配置 -----------------------------------------
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3   # 4 卡（与 unisvq_qwen3.6 脚本一致）
+CARD_BASE=4                                # 起始物理卡号（与 unisvq_qwen3.6 脚本一致）
+export ASCEND_RT_VISIBLE_DEVICES=$CARD_BASE,$((CARD_BASE+1)),$((CARD_BASE+2)),$((CARD_BASE+3))
 export MALLOC_ARENA_MAX=4
 
 CKPT=/home/l50062354/models/Qwen3.6-35B-A3B
 CALIB_DATA=/home/l50062354/datasets/calib_corpus_R9tau.jsonl
-BASE=/home/l50062354/vptq_qwen36
+BASE=/home/l50062354/VPTQ-qwen36/results
 HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt（与旋转无关）
 QUANT_DIR=$BASE/quant-tile32x32-wrap    # Step2 产物（--wrap-rotation 版）
 OUT_DIR=$BASE/hf-vptq-tile32x32-wrap-bf16  # Step3 产物: 可部署 checkpoint 副本
@@ -108,7 +109,7 @@ if [ "$DO_STEP2" -eq 1 ]; then
     for i in $(seq 0 $((N_CARDS - 1))); do
         e0=$((i * SHARD)); e1=$((e0 + SHARD))
         echo "[step2] shard $i: npu:$i experts $e0:$e1 -> $QUANT_DIR/shard$i.log"
-        ASCEND_RT_VISIBLE_DEVICES=$i python3 -m vptq.tools.quantize.run_qwen36 \
+        ASCEND_RT_VISIBLE_DEVICES=$((CARD_BASE + i)) python3 -m vptq.tools.quantize.run_qwen36 \
             --ckpt "$CKPT" \
             --hessian-dir "$HESS_DIR" \
             --output-dir "$QUANT_DIR" \

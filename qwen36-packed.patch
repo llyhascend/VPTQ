@@ -1,0 +1,1671 @@
+From 1a9b09d1c10f86ee2500bebd14afc819cdf10e48 Mon Sep 17 00:00:00 2001
+From: Teka <alXeg_FGVkincCQp.Teka@noreply.gitcode.com>
+Date: Thu, 8 Oct 2026 19:20:11 +0800
+Subject: [PATCH 1/3] =?UTF-8?q?Qwen3.6-35B-A3B=20(qwen3=5F5=5Fmoe=20packed?=
+ =?UTF-8?q?=20experts)=20=E4=B8=93=E5=AE=B6=E9=87=8F=E5=8C=96=E9=80=82?=
+ =?UTF-8?q?=E9=85=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- vptq/tools/qwen36/collect_hessian.py: 融合 experts 模块单 hook 双组
+  逐专家 Hessian（mlp_in 路由 token / down_proj SwiGLU 中间激活），
+  layer_XXXX.pt 与通用采集器格式逐字节兼容
+- vptq/tools/quantize/run_qwen36.py: 打包 3D 专家 [e] 切片 + gate|up
+  行拆分联合量化；前缀自动探测；.parts/quant_report 语义同 run.py
+- vptq/tools/quantize/rebuild_qwen36.py: 2D 重建 + 256 专家重打包 3D，
+  assemble 复用 rebuild_bf16.pass_assemble
+- hessian_io.py: HessianStore identity 回退维度参数化(identity_dims)；
+  wrap 模式组键增加 qwen down_proj 分支
+- quantize_qwen36_experts.sh: 4 卡三步流水线（无看门狗，fail-fast）
+- CPU 冒烟通过: 合成打包 checkpoint 端到端，形状/gate|up 行序/scale
+  折回/未量化权重保留均校验（/tmp/smoke_qwen36.py）
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ quantize_qwen36_experts.sh            | 141 +++++++++++
+ vptq/tools/quantize/hessian_io.py     |  48 +++-
+ vptq/tools/quantize/rebuild_qwen36.py | 153 ++++++++++++
+ vptq/tools/quantize/run_qwen36.py     | 316 ++++++++++++++++++++++++
+ vptq/tools/qwen36/__init__.py         |   5 +
+ vptq/tools/qwen36/collect_hessian.py  | 331 ++++++++++++++++++++++++++
+ 6 files changed, 983 insertions(+), 11 deletions(-)
+ create mode 100755 quantize_qwen36_experts.sh
+ create mode 100644 vptq/tools/quantize/rebuild_qwen36.py
+ create mode 100644 vptq/tools/quantize/run_qwen36.py
+ create mode 100644 vptq/tools/qwen36/__init__.py
+ create mode 100644 vptq/tools/qwen36/collect_hessian.py
+
+diff --git a/quantize_qwen36_experts.sh b/quantize_qwen36_experts.sh
+new file mode 100755
+index 0000000..90665c9
+--- /dev/null
++++ b/quantize_qwen36_experts.sh
+@@ -0,0 +1,141 @@
++#!/bin/bash
++# =============================================================================
++# Qwen3.6-35B-A3B 路由专家 VPTQ 量化流水线（前三步：Hessian 采集 → 量化 → 装配）
++#
++# 分支：qwen36-packed（VPTQ-qwen36 本地 clone，root 上游仓库只读）
++# 无看门狗 / 无 cron / 无 staging / 无重试 —— 顺序执行 + fail-fast
++# （set -euo pipefail），任一步失败人工排查后从该步重跑；各步产物幂等
++# （已存在的层文件 / .parts 自动跳过），重跑只补缺不重做。
++#
++# checkpoint 实测事实（2026-10-08，model.safetensors.index.json）：
++#   - Qwen3_5MoeForConditionalGeneration / qwen3_5_moe，混合注意力
++#     （3 线性 : 1 全注意力）—— 仅量化专家，注意力不触碰，无影响
++#   - 路由专家打包 3D 张量：mlp.experts.gate_up_proj (256,1024,2048)
++#     （gate|up 融合各 512 行）、mlp.experts.down_proj (256,2048,512)
++#   - 前缀 model.language_model.layers.{i}；hidden=2048, inter=512,
++#     40 层, 256 专家, top-8, bf16
++#
++# 三步对应的适配代码（本分支新增，CPU 冒烟通过 /tmp/smoke_qwen36.py）：
++#   Step1 vptq/tools/qwen36/collect_hessian.py —— 专家输入/SwiGLU 中间激活
++#         逐专家 H（融合 experts 模块无 per-expert Linear 可 hook，单 hook
++#         双组）；输出 layer_XXXX.pt 与通用采集器逐字节同格式
++#   Step2 vptq/tools/quantize/run_qwen36.py —— [e] 切片 + gate|up 行拆分
++#         联合量化（共享 mlp_in H），.parts/quant_report.json 语义同 run.py
++#   Step3 vptq/tools/quantize/rebuild_qwen36.py —— 2D 重建 + 256 专家重打包
++#         3D，assemble 复用 rebuild_bf16.pass_assemble 原样换入 shard
++#
++# 用法: bash quantize_qwen36_experts.sh
++#       单独重跑某步：将对应 DO_STEPx 置 1、其余置 0
++# =============================================================================
++set -euo pipefail
++cd /home/l50062354/VPTQ-qwen36   # python -m vptq 依赖仓库根目录
++
++# ----------------------------- 配置 -----------------------------------------
++export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3   # 4 卡（与 unisvq_qwen3.6 脚本一致）
++export MALLOC_ARENA_MAX=4
++
++CKPT=/home/l50062354/models/Qwen3.6-35B-A3B
++CALIB_DATA=/home/l50062354/datasets/calib_corpus_R9tau.jsonl
++BASE=/home/l50062354/vptq_qwen36
++HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt
++QUANT_DIR=$BASE/quant-tile32x16    # Step2 产物: quant_layer_XXXX_e*_e*.pt
++OUT_DIR=$BASE/hf-vptq-tile32x16-bf16  # Step3 产物: 可部署 checkpoint 副本
++
++N_LAYERS=40                        # text_config.num_hidden_layers
++N_EXPERTS=256                      # text_config.num_experts
++N_CARDS=4
++SHARD=$((N_EXPERTS / N_CARDS))     # 64 专家/卡
++HESS_SHARD=8                       # 每片层数：累加器 ~4.3GB/层
++                                   # (256×(2048²+512²)fp32)，8 层 ≈ 35GB/片
++
++DO_STEP1=1
++DO_STEP2=1
++DO_STEP3=1
++
++# ----------------------------- 环境自检 -------------------------------------
++python3 -c "import torch_npu" 2>/dev/null || {
++    echo "ERROR: torch_npu 不可用（先 source CANN set_env.sh / 进入 NPU 环境）"
++    exit 1
++}
++[ -f "$CKPT/model.safetensors.index.json" ] || { echo "ERROR: 缺 $CKPT index"; exit 1; }
++[ -f "$CALIB_DATA" ] || { echo "ERROR: 缺校准语料 $CALIB_DATA"; exit 1; }
++
++# =============================================================================
++# Step 1: Hessian 采集（按层分片，控累加器显存）
++#   128×4096 校准语料过一遍前向，逐专家累计路由 token 的 E[xxᵀ]（mlp_in）
++#   与 SwiGLU 中间激活的 E[aaᵀ]（down_proj），每层一个 layer_XXXX.pt。
++#   已齐的片直接跳过。
++# =============================================================================
++if [ "$DO_STEP1" -eq 1 ]; then
++    mkdir -p "$HESS_DIR"
++    for ((s = 0; s < N_LAYERS; s += HESS_SHARD)); do
++        e=$((s + HESS_SHARD)); [ $e -gt $N_LAYERS ] && e=$N_LAYERS
++        have=0
++        for ((l = s; l < e; l++)); do
++            [ -f "$HESS_DIR/layer_$(printf '%04d' "$l").pt" ] && have=$((have+1))
++        done
++        if [ "$have" -eq $((e - s)) ]; then
++            echo "[step1] hessian $s:$e 已完成，跳过"
++            continue
++        fi
++        echo "[step1] hessian $s:$e 采集中..."
++        python3 -m vptq.tools.qwen36.collect_hessian \
++            --model "$CKPT" \
++            --data-path "$CALIB_DATA" \
++            --output-dir "$HESS_DIR" \
++            --nsamples 128 --seqlen 4096 --batch-size 4 \
++            --model-dtype bf16 --device-map auto \
++            --accum-device npu \
++            --layer-range "$s:$e"
++    done
++    echo "[step1] 全部完成: $HESS_DIR ($(ls "$HESS_DIR"/layer_*.pt | wc -l)/$N_LAYERS 层)"
++fi
++
++# =============================================================================
++# Step 2: 量化（4 卡并行，每卡 64 专家 × 40 层）
++#   tile 方案 ≈2.66bit/权重；产物 quant_layer_XXXX_e{e0}_{e1}.pt +
++#   quant_report.json（proxy_error 为质量首要指标）
++# =============================================================================
++if [ "$DO_STEP2" -eq 1 ]; then
++    mkdir -p "$QUANT_DIR"
++    pids=()
++    for i in $(seq 0 $((N_CARDS - 1))); do
++        e0=$((i * SHARD)); e1=$((e0 + SHARD))
++        echo "[step2] shard $i: npu:$i experts $e0:$e1 -> $QUANT_DIR/shard$i.log"
++        ASCEND_RT_VISIBLE_DEVICES=$i python3 -m vptq.tools.quantize.run_qwen36 \
++            --ckpt "$CKPT" \
++            --hessian-dir "$HESS_DIR" \
++            --output-dir "$QUANT_DIR" \
++            --vector-len 2 --num-centroids 16 --num-res-centroids -1 \
++            --row-tile 16 --centroid-fp8 --group-num 128 --kmeans-iters 5 \
++            --device npu --layer-range "0:$N_LAYERS" \
++            --expert-range "$e0:$e1" \
++            --hidden-size 2048 --moe-intermediate 512 \
++            > "$QUANT_DIR/shard$i.log" 2>&1 &
++        pids+=($!)
++    done
++    for pid in "${pids[@]}"; do wait "$pid"; done
++    echo "[step2] 全部完成，质量报告: $QUANT_DIR/quant_report.json"
++fi
++
++# =============================================================================
++# Step 3: rebuild + 装配（两个 pass，产出可部署 checkpoint 副本）
++#   pass1: per-expert 2D 重建（scale 折回）→ 256 专家重打包 3D parts
++#   pass2: --assemble 复用 rebuild_bf16.pass_assemble 换入 shard 副本，
++#          其余权重（attn/router/shared/mtp/embed）原样拷贝
++# =============================================================================
++if [ "$DO_STEP3" -eq 1 ]; then
++    mkdir -p "$OUT_DIR"
++    echo "[step3] pass1: rebuild 打包 3D 权重..."
++    python3 -m vptq.tools.quantize.rebuild_qwen36 \
++        --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
++        --layer-range "0:$N_LAYERS" --group-num 128 --row-tile 16 --device npu
++    echo "[step3] pass2: assemble 装配部署权重..."
++    python3 -m vptq.tools.quantize.rebuild_qwen36 \
++        --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
++        --layer-range "0:$N_LAYERS" --group-num 128 --row-tile 16 --device npu \
++        --assemble
++    echo "[step3] 全部完成: $OUT_DIR"
++fi
++
++echo "PIPELINE DONE: $OUT_DIR"
+diff --git a/vptq/tools/quantize/hessian_io.py b/vptq/tools/quantize/hessian_io.py
+index 383b6ef..b0475d6 100644
+--- a/vptq/tools/quantize/hessian_io.py
++++ b/vptq/tools/quantize/hessian_io.py
+@@ -6,7 +6,7 @@
+ 
+ import logging
+ import os
+-from typing import Dict, Optional, Tuple
++from typing import Callable, Dict, Optional, Tuple
+ 
+ import torch
+ 
+@@ -17,10 +17,15 @@ logger = logging.getLogger("vptq.quantize.hessian")
+ # Hadamard-absorbed (vptq/tools/deepseek_v4/rotate_ckpt.py). These are the
+ # groups feeding input-side-rotated weights: mlp_in (w1/w3/router) and the
+ # attention linears that read the normalized residual stream.
+-_ROTATED_ATTN_KEYS = frozenset({
+-    "attn.wq_a", "attn.wkv", "attn.compressor.wkv",
+-    "attn.compressor.wgate", "attn.indexer.weights_proj",
+-})
++_ROTATED_ATTN_KEYS = frozenset(
++    {
++        "attn.wq_a",
++        "attn.wkv",
++        "attn.compressor.wkv",
++        "attn.compressor.wgate",
++        "attn.indexer.weights_proj",
++    }
++)
+ 
+ 
+ def is_rotated_group(group_key: str, wrap: bool = False) -> bool:
+@@ -34,8 +39,15 @@ def is_rotated_group(group_key: str, wrap: bool = False) -> bool:
+     """
+     if group_key.endswith("mlp_in"):
+         return True
+-    if wrap and group_key.startswith("ffn.experts.") \
+-            and group_key.endswith(".w2"):
++    if wrap and (
++        (group_key.startswith("ffn.experts.") and group_key.endswith(".w2"))
++        or (
++            group_key.startswith("mlp.experts.")
++            and group_key.endswith("down_proj")
++        )
++    ):
++        # qwen3_5_moe packed 布局的 per-expert down_proj 同理（wrap 模式
++        # 全部量化叶子都是输入侧）
+         return True
+     return group_key in _ROTATED_ATTN_KEYS
+ 
+@@ -98,10 +110,18 @@ class HessianStore:
+     scheme, unlike the absorbed pipeline).
+     """
+ 
+-    def __init__(self, hessian_dir: str, rotation_path: Optional[str] = None,
+-                 wrap: bool = False):
++    def __init__(
++        self,
++        hessian_dir: str,
++        rotation_path: Optional[str] = None,
++        wrap: bool = False,
++        identity_dims: Optional[Callable[[str], int]] = None,
++    ):
+         self.dir = hessian_dir
+         self.wrap = wrap
++        # 缺组回退单位阵的维度（模型相关）：None = DSV4 语义（.w2→2048，
++        # 其余→4096）；qwen3_5_moe 传 mlp_in→hidden / down_proj→inter
++        self.identity_dims = identity_dims
+         self._cache_idx: Optional[int] = None
+         self._cache: Optional[Dict[str, dict]] = None
+         self.R: Optional[torch.Tensor] = None
+@@ -140,11 +160,17 @@ class HessianStore:
+             # 小语料（如 calibR9 49 条）下 0 命中的冷门专家无 Hessian 组：
+             # 回退单位阵——加权退化为均匀、误差传播退化为近恒等，
+             # 该专家等价朴素 VQ（无校准信息下的最保守行为）
+-            n = 2048 if group_key.endswith(".w2") else 4096
++            if self.identity_dims is not None:
++                n = self.identity_dims(group_key)
++            else:
++                n = 2048 if group_key.endswith(".w2") else 4096
+             logger.warning(
+                 "group %s missing at layer %d (zero-hit expert); "
+                 "fall back to identity Hessian (%dx%d)",
+-                group_key, layer_idx, n, n,
++                group_key,
++                layer_idx,
++                n,
++                n,
+             )
+             return torch.eye(n), None
+         H, inv = entry["hessian"], entry.get("inv_hessian")
+diff --git a/vptq/tools/quantize/rebuild_qwen36.py b/vptq/tools/quantize/rebuild_qwen36.py
+new file mode 100644
+index 0000000..9f1a991
+--- /dev/null
++++ b/vptq/tools/quantize/rebuild_qwen36.py
+@@ -0,0 +1,153 @@
++# -------------------------------------------------------------------------
++# Copyright (c) Microsoft Corporation. All rights reserved.
++# Licensed under the MIT License.
++# --------------------------------------------------------------------------
++"""Rebuild + assemble BF16 deployment weights for Qwen3.6-35B-A3B
++quantized by run_qwen36.py (packed 3D expert layout).
++
++Counterpart of rebuild_bf16.py for the qwen3_5_moe checkpoint: the
++per-expert QuantizedWeights are reconstructed to 2D, gate|up rows are
++concatenated back into `gate_up_proj[e]`, all experts stacked into the
++packed 3D tensors, and pass_assemble (imported from rebuild_bf16,
++unchanged) swaps them into a checkpoint copy:
++
++    expert_parts/model.language_model.layers.{i}.mlp.experts.gate_up_proj
++        .safetensors  {"w": (E, 2*inter, hidden) bf16}
++    expert_parts/...mlp.experts.down_proj.safetensors {"w": (E, hidden, inter)}
++
++Two passes, same CLI contract as rebuild_bf16:
++    python -m vptq.tools.quantize.rebuild_qwen36 --ckpt ... --quant-dir ... \
++        --output-dir ... --layer-range 0:40 --group-num 128 --row-tile 16
++    python -m vptq.tools.quantize.rebuild_qwen36 ... --assemble
++"""
++
++import argparse
++import json
++import logging
++import os
++
++import torch
++from safetensors.torch import save_file
++
++from vptq.tools.quantize.rebuild_bf16 import (
++    load_layer_quant,
++    pass_assemble,
++    reconstruct_weight,
++    wmap_shape,
++)
++
++logging.basicConfig(
++    level=logging.INFO,
++    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
++)
++logger = logging.getLogger("vptq.quantize.rebuild_qwen36")
++
++_PREFIX_CANDIDATES = (
++    "model.language_model.layers.{i}.",
++    "model.layers.{i}.",
++    "layers.{i}.",
++)
++
++
++def detect_layer_prefix(weight_map: dict) -> str:
++    for tmpl in _PREFIX_CANDIDATES:
++        probe = tmpl.format(i=0) + "mlp.experts.gate_up_proj"
++        if probe in weight_map:
++            return tmpl
++    raise ValueError("packed expert tensors not found in checkpoint index")
++
++
++def _fold_scales(qw, Q, out_f, in_f):
++    """Mirror rebuild_bf16.pass_rebuild: multiply stored scales back."""
++    if getattr(qw, "row_scale", None) is not None:
++        s = qw.row_scale[:out_f].to(Q.device).float()
++        Q = Q.float() * s[:, None]
++        if getattr(qw, "col_scale", None) is not None:
++            d = qw.col_scale[:in_f].to(Q.device).float()
++            Q = Q * d[None, :]
++    return Q
++
++
++@torch.no_grad()
++def pass_rebuild_qwen(args):
++    with open(os.path.join(args.ckpt, "model.safetensors.index.json")) as f:
++        wmap = json.load(f)["weight_map"]
++    prefix = detect_layer_prefix(wmap)
++    os.makedirs(args.parts_dir, exist_ok=True)
++    device = torch.device(args.device)
++    for layer_idx in range(*args.layer_range):
++        quant = load_layer_quant(args.quant_dir, layer_idx)
++        if not quant:
++            logger.warning("layer %d: no quant files, skip", layer_idx)
++            continue
++        gu_full = prefix.format(i=layer_idx) + "mlp.experts.gate_up_proj"
++        dn_full = prefix.format(i=layer_idx) + "mlp.experts.down_proj"
++        outs = {}
++        for full in (gu_full, dn_full):
++            part = os.path.join(args.parts_dir, full + ".safetensors")
++            if os.path.exists(part):
++                logger.info("exists, skip: %s", part)
++            else:
++                outs[full] = part
++        if not outs:
++            continue
++        n_experts, gu_rows, hidden = wmap_shape(args.ckpt, wmap, gu_full)
++        _, dn_out, inter = wmap_shape(args.ckpt, wmap, dn_full)
++        assert gu_rows == 2 * inter, (gu_rows, inter)
++        gate_up = torch.empty(n_experts, gu_rows, hidden, dtype=torch.float32)
++        down = torch.empty(n_experts, dn_out, inter, dtype=torch.float32)
++        for e in range(n_experts):
++            qg = reconstruct_weight(
++                quant[f"experts.{e}.gate"],
++                args.group_num,
++                args.row_tile,
++                device,
++            )
++            qu = reconstruct_weight(
++                quant[f"experts.{e}.up"], args.group_num, args.row_tile, device
++            )
++            qd = reconstruct_weight(
++                quant[f"experts.{e}.down"],
++                args.group_num,
++                args.row_tile,
++                device,
++            )
++            qg = _fold_scales(quant[f"experts.{e}.gate"], qg, inter, hidden)
++            qu = _fold_scales(quant[f"experts.{e}.up"], qu, inter, hidden)
++            qd = _fold_scales(quant[f"experts.{e}.down"], qd, hidden, inter)
++            # 行序即 Qwen3_5MoeExperts.forward 的 chunk 顺序：[0:inter]=gate
++            gate_up[e] = torch.cat([qg[:inter], qu[:inter]], 0).float()
++            down[e] = qd[:hidden].float()
++        for full, tensor in ((gu_full, gate_up), (dn_full, down)):
++            path = os.path.join(args.parts_dir, full + ".safetensors")
++            tmp = path + ".tmp"
++            save_file(
++                {"w": tensor.to(torch.bfloat16).cpu().contiguous()},
++                tmp,
++            )
++            os.replace(tmp, path)
++            logger.info("rebuilt %s %s", tuple(tensor.shape), full)
++        del quant, gate_up, down
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--quant-dir", required=True)
++    p.add_argument("--ckpt", required=True)
++    p.add_argument("--output-dir", required=True)
++    p.add_argument("--layer-range", default="0:40")
++    p.add_argument("--group-num", type=int, default=128)
++    p.add_argument("--row-tile", type=int, default=256)
++    p.add_argument("--device", default="npu")
++    p.add_argument("--assemble", action="store_true")
++    args = p.parse_args()
++    args.parts_dir = os.path.join(args.output_dir, "expert_parts")
++    args.layer_range = tuple(int(x) for x in args.layer_range.split(":"))
++    if args.assemble:
++        pass_assemble(args)
++    else:
++        pass_rebuild_qwen(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vptq/tools/quantize/run_qwen36.py b/vptq/tools/quantize/run_qwen36.py
+new file mode 100644
+index 0000000..ff03914
+--- /dev/null
++++ b/vptq/tools/quantize/run_qwen36.py
+@@ -0,0 +1,316 @@
++# -------------------------------------------------------------------------
++# Copyright (c) Microsoft Corporation. All rights reserved.
++# Licensed under the MIT License.
++# --------------------------------------------------------------------------
++"""Quantization driver for Qwen3.6-35B-A3B routed experts
++(qwen3_5_moe packed layout; task-scoped sibling of run.py, which is
++DeepSeek-V4 specific).
++
++Checkpoint facts this driver is written against (2026-10-08,
++model.safetensors.index.json of Qwen3.6-35B-A3B):
++  - routed experts are fused 3D tensors, no per-expert leaves,
++    no `.weight` suffix:
++      {prefix}mlp.experts.gate_up_proj (E, 2*inter, hidden)  gate|up fused
++      {prefix}mlp.experts.down_proj    (E, hidden, inter)
++  - prefix `model.language_model.layers.{i}.` (composite multimodal
++    model); auto-detected here, `model.layers.{i}.` / `layers.{i}.` also
++    accepted
++Per expert e (gate|up row split exactly as Qwen3_5MoeExperts.forward
++chunks them):
++  gate = gate_up[e][:inter], up = gate_up[e][inter:]
++      -> vptq_quantize_joint on the shared mlp_in Hessian
++         (same amortization as run.py's w1+w3 joint path)
++  down = down_proj[e]         -> vptq_quantize on its own Hessian
++Hessian groups (from vptq.tools.qwen36.collect_hessian):
++  mlp.experts.{e}.mlp_in (hidden^2), mlp.experts.{e}.down_proj (inter^2)
++
++Output mirrors run.py so downstream tooling works unchanged:
++  quant_layer_XXXX_e{e0}_{e1}.pt  {short: QuantizedWeight}
++    short in {experts.{e}.gate, experts.{e}.up, experts.{e}.down}
++  quant_report.json (keyed by full checkpoint names) + .parts resume
++Not covered (by design, bring-up scope = experts only): attention /
++router / shared expert, dual-norm, row-fp8, rotation wrap; the DSV4
++variants of these live in run.py and do not apply to the packed layout.
++"""
++
++import argparse
++import json
++import logging
++import os
++
++import torch
++
++from vptq.tools.quantize.config import QuantConfig
++from vptq.tools.quantize.hessian_io import HessianStore
++from vptq.tools.quantize.run import PartsStaging, WeightStore
++from vptq.tools.quantize.vq import (
++    vptq_quantize,
++    vptq_quantize_joint,
++)
++
++logging.basicConfig(
++    level=logging.INFO,
++    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
++)
++logger = logging.getLogger("vptq.quantize.run_qwen36")
++
++_PREFIX_CANDIDATES = (
++    "model.language_model.layers.{i}.",  # composite multimodal (this ckpt)
++    "model.layers.{i}.",  # plain HF causal LM
++    "layers.{i}.",  # native inference format
++)
++
++
++def detect_layer_prefix(weight_map: dict) -> str:
++    for tmpl in _PREFIX_CANDIDATES:
++        probe = tmpl.format(i=0) + "mlp.experts.gate_up_proj"
++        if probe in weight_map:
++            logger.info("layer prefix: %s", tmpl.format(i="<i>"))
++            return tmpl
++    raise ValueError(
++        "no packed expert tensors found; tried "
++        f"{[t.format(i=0) + 'mlp.experts.gate_up_proj' for t in _PREFIX_CANDIDATES]}"
++    )
++
++
++def quantize_expert(
++    e: int,
++    layer_idx: int,
++    gate_up_e: torch.Tensor,
++    down_e: torch.Tensor,
++    store: HessianStore,
++    config: QuantConfig,
++    device: torch.device,
++) -> dict:
++    """Quantize one expert -> {short: QuantizedWeight}.
++
++    gate_up_e: (2*inter, hidden); down_e: (hidden, inter).
++    """
++    inter = gate_up_e.shape[0] // 2
++    hess_key_in = f"mlp.experts.{e}.mlp_in"
++    hess_key_dn = f"mlp.experts.{e}.down_proj"
++    out = {}
++    # gate|up 联合量化：共享 mlp_in Hessian，一次批量 kmeans
++    # （与 run.py 的 w1+w3 joint 同构，vptq_quantize_joint 要求同形状）
++    Wg = gate_up_e[:inter].float()
++    Wu = gate_up_e[inter:].float()
++    hessian_in, _ = store.get(layer_idx, hess_key_in)
++    HinvU_in = store.cholesky_upper(layer_idx, hess_key_in, damp=config.damp)
++    qw_g, qw_u = vptq_quantize_joint(
++        [Wg, Wu],
++        hessian_in.float(),
++        config,
++        device=device,
++        hessian_inv_upper=HinvU_in,
++        kmeans_seed=hash(f"layers.{layer_idx}.experts.{e}.gate") & 0xFFFF,
++    )
++    logger.info(
++        "layer %d expert %d gate/up joint -> H[%s] " "proxy_error=%.5f/%.5f",
++        layer_idx,
++        e,
++        hess_key_in,
++        qw_g.proxy_error,
++        qw_u.proxy_error,
++    )
++    out[f"experts.{e}.gate"] = qw_g
++    out[f"experts.{e}.up"] = qw_u
++
++    Wd = down_e.float()
++    hessian_dn, _ = store.get(layer_idx, hess_key_dn)
++    HinvU_dn = store.cholesky_upper(layer_idx, hess_key_dn, damp=config.damp)
++    qw_d = vptq_quantize(
++        Wd,
++        hessian_dn.float(),
++        config,
++        device=device,
++        hessian_inv_upper=HinvU_dn,
++        kmeans_seed=hash(f"layers.{layer_idx}.experts.{e}.down") & 0xFFFF,
++    )
++    logger.info(
++        "layer %d expert %d down -> H[%s] proxy_error=%.5f mse=%.5f",
++        layer_idx,
++        e,
++        hess_key_dn,
++        qw_d.proxy_error,
++        qw_d.mse,
++    )
++    out[f"experts.{e}.down"] = qw_d
++    return out
++
++
++def main():
++    p = argparse.ArgumentParser()
++    p.add_argument("--ckpt", required=True)
++    p.add_argument("--hessian-dir", required=True)
++    p.add_argument("--output-dir", required=True)
++    p.add_argument("--vector-len", type=int, default=8)
++    p.add_argument("--num-centroids", type=int, default=65536)
++    p.add_argument("--num-res-centroids", type=int, default=-1)
++    p.add_argument("--group-num", type=int, default=1)
++    p.add_argument("--kmeans-iters", type=int, default=10)
++    p.add_argument("--row-tile", type=int, default=0)
++    p.add_argument("--res-vector-len", type=int, default=0)
++    p.add_argument("--centroid-fp8", action="store_true")
++    p.add_argument("--device", default="npu")
++    p.add_argument("--layer-range", default=None, help="start:end")
++    p.add_argument("--expert-range", default=None, help="start:end")
++    p.add_argument("--n-experts", type=int, default=256)
++    p.add_argument(
++        "--hidden-size",
++        type=int,
++        default=2048,
++        help="mlp_in identity-fallback dim (zero-hit experts).",
++    )
++    p.add_argument(
++        "--moe-intermediate",
++        type=int,
++        default=512,
++        help="down_proj identity-fallback dim.",
++    )
++    p.add_argument(
++        "--save-staging",
++        default=None,
++        help="Local NVMe dir to stage quant parts (perf on NFS).",
++    )
++    args = p.parse_args()
++
++    config = QuantConfig(
++        vector_len=args.vector_len,
++        num_centroids=args.num_centroids,
++        num_res_centroids=args.num_res_centroids,
++        group_num=args.group_num,
++        kmeans_iters=args.kmeans_iters,
++        res_vector_len=args.res_vector_len,
++        row_tile=args.row_tile,
++        centroid_fp8=args.centroid_fp8,
++    )
++    logger.info("config: %s (%.3f bits/weight)", config, config.bits_per_weight)
++    device = torch.device(args.device)
++
++    def identity_dims(group_key: str) -> int:
++        return (
++            args.hidden_size
++            if group_key.endswith("mlp_in")
++            else args.moe_intermediate
++        )
++
++    weights = WeightStore(args.ckpt)
++    prefix = detect_layer_prefix(weights.weight_map)
++    store = HessianStore(args.hessian_dir, identity_dims=identity_dims)
++    staging = None
++    if args.save_staging:
++        staging = PartsStaging(args.save_staging)
++        staging.flush_residual(args.output_dir)
++    os.makedirs(args.output_dir, exist_ok=True)
++
++    layer_range = (0, 40)
++    if args.layer_range:
++        layer_range = tuple(int(x) for x in args.layer_range.split(":"))
++    expert_range = None
++    if args.expert_range:
++        expert_range = tuple(int(x) for x in args.expert_range.split(":"))
++    logger.info("expert range: %s", expert_range or "(all)")
++
++    report = {}
++    for layer_idx in range(*layer_range):
++        suffix = ""
++        if expert_range:
++            suffix = f"_e{expert_range[0]}_{expert_range[1]}"
++        path = os.path.join(
++            args.output_dir, f"quant_layer_{layer_idx:04d}{suffix}.pt"
++        )
++        parts_dir = path[:-3] + ".parts"
++        os.makedirs(parts_dir, exist_ok=True)
++
++        def part_path(short, _d=parts_dir):
++            return os.path.join(_d, short + ".pt")
++
++        done_shorts = {
++            f[:-3] for f in os.listdir(parts_dir) if f.endswith(".pt")
++        }
++
++        def on_weight(short, qw):
++            if staging is not None:
++                local = os.path.join(
++                    staging.dir, os.path.basename(parts_dir), short + ".pt"
++                )
++                os.makedirs(os.path.dirname(local), exist_ok=True)
++                ltmp = local + ".ltmp"
++                torch.save(qw, ltmp)
++                os.replace(ltmp, local)
++                staging.save(local, part_path(short))
++            else:
++                tmp = part_path(short) + ".tmp"
++                torch.save(qw, tmp)
++                os.replace(tmp, part_path(short))
++
++        # 打包张量整层读一次（gate_up ~1GB bf16），分片内 64 专家切片复用
++        gu_name = prefix.format(i=layer_idx) + "mlp.experts.gate_up_proj"
++        dn_name = prefix.format(i=layer_idx) + "mlp.experts.down_proj"
++        gate_up = weights.get(gu_name)
++        down = weights.get(dn_name)
++        e0, e1 = expert_range or (0, args.n_experts)
++        out = {}
++        for e in range(e0, e1):
++            shorts = (
++                f"experts.{e}.gate",
++                f"experts.{e}.up",
++                f"experts.{e}.down",
++            )
++            if all(s in done_shorts for s in shorts):
++                continue
++            # per-expert 粒度续跑：半途专家整体重量化，parts 原子覆盖无损
++            new = quantize_expert(
++                e,
++                layer_idx,
++                gate_up[e],
++                down[e],
++                store,
++                config,
++                device,
++            )
++            out.update(new)
++            for s, qw in new.items():
++                on_weight(s, qw)
++        del gate_up, down
++
++        merged: dict = {}
++        for short in sorted(done_shorts | set(out)):
++            merged[short] = torch.load(part_path(short), weights_only=False)
++        tmp = path + ".tmp"
++        torch.save(merged, tmp)
++        os.replace(tmp, path)
++        for short, qw in out.items():
++            report[f"{prefix.format(i=layer_idx)}mlp.experts.{short}"] = {
++                "proxy_error": qw.proxy_error,
++                "mse": qw.mse,
++            }
++        logger.info(
++            "saved %s (%d new, %d total experts quantized)",
++            path,
++            len(out) // 3,
++            len(merged) // 3,
++        )
++
++    if staging is not None:
++        staging.finish()
++    report_path = os.path.join(args.output_dir, "quant_report.json")
++    existing = {}
++    if os.path.exists(report_path):
++        existing = json.load(open(report_path))
++    existing.update(report)
++    existing["_config"] = {
++        "vector_len": config.vector_len,
++        "num_centroids": config.num_centroids,
++        "num_res_centroids": config.num_res_centroids,
++        "group_num": config.group_num,
++        "bits_per_weight": config.bits_per_weight,
++        "model": "qwen3_5_moe-packed-experts",
++    }
++    with open(report_path, "w") as f:
++        json.dump(existing, f, indent=2)
++    logger.info("report written to %s", report_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vptq/tools/qwen36/__init__.py b/vptq/tools/qwen36/__init__.py
+new file mode 100644
+index 0000000..37b2db4
+--- /dev/null
++++ b/vptq/tools/qwen36/__init__.py
+@@ -0,0 +1,5 @@
++# -------------------------------------------------------------------------
++# Copyright (c) Microsoft Corporation. All rights reserved.
++# Licensed under the MIT License.
++# --------------------------------------------------------------------------
++"""Qwen3.6-35B-A3B (qwen3_5_moe, packed experts) quantization support."""
+diff --git a/vptq/tools/qwen36/collect_hessian.py b/vptq/tools/qwen36/collect_hessian.py
+new file mode 100644
+index 0000000..8f9129c
+--- /dev/null
++++ b/vptq/tools/qwen36/collect_hessian.py
+@@ -0,0 +1,331 @@
++# -------------------------------------------------------------------------
++# Copyright (c) Microsoft Corporation. All rights reserved.
++# Licensed under the MIT License.
++# --------------------------------------------------------------------------
++"""Offline per-expert Hessian collection for Qwen3.6-35B-A3B
++(HF qwen3_5_moe, packed 3D expert layout).
++
++Why a dedicated collector: the generic vptq.tools.hessian hooks
++`nn.Linear` inputs, but this architecture stores the routed experts as
++fused 3D parameters (`mlp.experts.gate_up_proj` (E, 2*inter, hidden) and
++`.down_proj` (E, hidden, inter)) inside one `Qwen3_5MoeExperts` module —
++there are no per-expert Linear leaves to hook, and the `down_proj` input
++(the SwiGLU intermediate) is not any module's input at all.
++
++One forward-pre-hook per decoder layer's `mlp.experts` module instead:
++the hook receives (hidden_states, top_k_index, top_k_weights), where the
++expert input is exactly `hidden_states[rows routed to e]`; the SwiGLU
++intermediate is recomputed from the live (unquantized) weights, matching
++the activations the real `down_proj` sees. Both Hessian groups per expert
++are accumulated from that single hook:
++    mlp.experts.{e}.mlp_in    (hidden, hidden)   routed-token E[x x^T]
++    mlp.experts.{e}.down_proj (inter, inter)     SwiGLU  E[a a^T]
++
++Output is byte-compatible with the generic collector
++(`layer_XXXX.pt` = {group_key: {"hessian", "mean", "n_tokens",
++["inv_hessian"]}} + meta.json), so HessianStore / run_qwen36.py consume
++it unchanged. Layer indices are positions in `model.language_model.layers`.
++
++Example:
++    python -m vptq.tools.qwen36.collect_hessian \
++        --model /home/l50062354/models/Qwen3.6-35B-A3B \
++        --data-path calib_corpus_R9tau.jsonl \
++        --output-dir ./hessians/qwen36 --nsamples 128 --seqlen 4096 \
++        --layer-range 0:8 --accum-device npu --model-dtype bf16
++"""
++
++import argparse
++import json
++import logging
++import os
++
++import torch
++
++from vptq.tools.hessian.__main__ import build_samples, load_texts
++from vptq.tools.hessian.collector import (
++    HessianAccumulator,
++    damped_inverse,
++)
++
++logging.basicConfig(
++    level=logging.INFO,
++    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
++)
++logger = logging.getLogger("vptq.qwen36.hessian")
++
++
++def parse_args():
++    p = argparse.ArgumentParser(
++        description="Per-expert Hessian collection for Qwen3.6-35B-A3B "
++        "(qwen3_5_moe packed experts)."
++    )
++    p.add_argument("--model", required=True, help="HF model name or path.")
++    p.add_argument("--output-dir", required=True)
++    p.add_argument(
++        "--data-path",
++        default=None,
++        help="Local jsonl (one text per line); overrides --dataset.",
++    )
++    p.add_argument(
++        "--dataset", default="togethercomputer/RedPajama-Data-1T-Sample"
++    )
++    p.add_argument("--dataset-config", default=None)
++    p.add_argument("--split", default="train")
++    p.add_argument("--text-field", default="text")
++    p.add_argument("--nsamples", type=int, default=128)
++    p.add_argument("--seqlen", type=int, default=4096)
++    p.add_argument("--seed", type=int, default=0)
++    p.add_argument("--batch-size", type=int, default=1)
++    p.add_argument("--layer-range", default=None, help="start:end")
++    p.add_argument(
++        "--accum-device", default="npu", choices=["cuda", "npu", "cpu"]
++    )
++    p.add_argument("--accum-dtype", default="fp32", choices=["fp32", "fp64"])
++    p.add_argument(
++        "--model-dtype", default="bf16", choices=["fp16", "bf16", "fp32"]
++    )
++    p.add_argument("--device-map", default="auto")
++    p.add_argument(
++        "--no-inv",
++        action="store_true",
++        help="Skip inverse Hessians (compute_inverse later).",
++    )
++    p.add_argument("--damp", type=float, default=0.01)
++    return p.parse_args()
++
++
++def find_text_layers(model):
++    """Decoder layer list of the composite multimodal model.
++
++    Qwen3_5MoeForConditionalGeneration.model (Qwen3_5MoeModel) holds
++    .language_model (Qwen3_5MoeTextModel) with .layers; be defensive
++    about the nesting in case of config-only-text checkpoints.
++    """
++    inner = getattr(model, "model", model)
++    text = getattr(inner, "language_model", inner)
++    layers = text.layers
++    logger.info("found %d decoder layers", len(layers))
++    return layers
++
++
++def register_expert_hooks(
++    model, layer_indices, accumulators, accum_device, accum_dtype
++):
++    """Forward-pre-hook on each layer's fused experts module.
++
++    Group keys match run_qwen36.py / the qwen mapping in hessian_io:
++    `mlp.experts.{e}.mlp_in` and `mlp.experts.{e}.down_proj`.
++    """
++    layers = find_text_layers(model)
++    handles = []
++
++    def get_acc(li, key, dim):
++        group = accumulators[li]
++        acc = group.get(key)
++        if acc is None:
++            acc = HessianAccumulator(
++                dim, dtype=accum_dtype, device=accum_device
++            )
++            group[key] = acc
++        return acc
++
++    def make_hook(li):
++        def hook(module, args):
++            hidden, topk_idx = args[0], args[1]
++            # hidden: (T, hidden) bf16 on the layer's device;
++            # topk_idx: (T, top_k) routing assignment
++            for e in torch.unique(topk_idx):
++                e = int(e)
++                if e >= module.num_experts:
++                    continue
++                sel = (topk_idx == e).any(-1).nonzero(as_tuple=True)[0]
++                x_e = hidden[sel]
++                get_acc(li, f"mlp.experts.{e}.mlp_in", x_e.shape[-1]).update(
++                    x_e
++                )
++                # SwiGLU intermediate = the actual down_proj input,
++                # recomputed with the live weights (same math as
++                # Qwen3_5MoeExperts.forward)
++                gate, up = torch.nn.functional.linear(
++                    x_e, module.gate_up_proj[e]
++                ).chunk(2, dim=-1)
++                a_e = module.act_fn(gate) * up
++                get_acc(li, f"mlp.experts.{e}.down_proj", a_e.shape[-1]).update(
++                    a_e
++                )
++
++        return hook
++
++    for idx in layer_indices:
++        experts = layers[idx].mlp.experts
++        if not hasattr(experts, "gate_up_proj"):
++            raise ValueError(
++                f"layer {idx}: mlp.experts has no packed gate_up_proj; "
++                "is this a qwen3_5_moe checkpoint?"
++            )
++        accumulators[idx] = {}
++        handles.append(experts.register_forward_pre_hook(make_hook(idx)))
++        logger.info(
++            "layer %d: hooked %s (%d experts)",
++            idx,
++            type(experts).__name__,
++            experts.num_experts,
++        )
++    return handles
++
++
++@torch.no_grad()
++def collect(
++    model,
++    samples,
++    layer_indices,
++    accumulators,
++    accum_device,
++    accum_dtype,
++    batch_size,
++):
++    was_training = model.training
++    model.eval()
++    if hasattr(model.config, "use_cache"):
++        model.config.use_cache = False
++    try:
++        input_device = model.get_input_embeddings().weight.device
++    except AttributeError:
++        input_device = next(model.parameters()).device
++    for start in range(0, samples.shape[0], batch_size):
++        ids = samples[start : start + batch_size].to(input_device)
++        model(input_ids=ids)
++        done = min(start + batch_size, samples.shape[0])
++        logger.info("processed %d/%d samples", done, samples.shape[0])
++    if was_training:
++        model.train()
++
++
++def save(
++    output_dir,
++    layer_indices,
++    accumulators,
++    save_inv=True,
++    damp=0.01,
++    model_name="",
++    extra_meta=None,
++):
++    """Write layer_XXXX.pt in the generic collector's exact format."""
++    os.makedirs(output_dir, exist_ok=True)
++    for idx in layer_indices:
++        payload = {}
++        for key, acc in sorted(accumulators[idx].items()):
++            hessian, mean, n_tokens = acc.finalize()
++            hessian = hessian.float().cpu()
++            entry = {
++                "hessian": hessian,
++                "mean": mean.float().cpu(),
++                "n_tokens": n_tokens,
++            }
++            if save_inv:
++                entry["inv_hessian"] = damped_inverse(hessian, damp=damp)
++            payload[key] = entry
++        path = os.path.join(output_dir, f"layer_{idx:04d}.pt")
++        tmp = path + ".tmp"
++        torch.save(payload, tmp)
++        os.replace(tmp, path)
++        logger.info("saved %s (%d groups)", path, len(payload))
++    meta = {
++        "model_name": model_name,
++        "layer_path": "model.language_model.layers",
++        "layer_indices": list(layer_indices),
++        "hook_plans": {
++            str(i): {
++                "experts_module": "mlp.experts",
++                "groups_per_expert": ["mlp_in", "down_proj"],
++            }
++            for i in layer_indices
++        },
++        "accum_dtype": "torch.float32",
++        "center": False,
++        "damp": damp,
++        "save_inv": save_inv,
++        "convention": "hessian = E[x x^T]",
++    }
++    if extra_meta:
++        meta.update(extra_meta)
++    with open(os.path.join(output_dir, "meta.json"), "w") as f:
++        json.dump(meta, f, indent=2)
++
++
++def main():
++    args = parse_args()
++    dtype_map = {
++        "fp16": torch.float16,
++        "bf16": torch.bfloat16,
++        "fp32": torch.float32,
++    }
++    layer_range = None
++    if args.layer_range is not None:
++        start, end = args.layer_range.split(":")
++        layer_range = (int(start), int(end))
++
++    import transformers
++    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
++        Qwen3_5MoeForConditionalGeneration,
++    )
++
++    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model)
++    model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
++        args.model,
++        torch_dtype=dtype_map[args.model_dtype],
++        device_map=args.device_map,
++    )
++    model.eval()
++
++    texts = load_texts(args)
++    samples = build_samples(
++        tokenizer, texts, args.nsamples, args.seqlen, args.seed
++    )
++
++    layers = find_text_layers(model)
++    end = min(layer_range[1] if layer_range else len(layers), len(layers))
++    start = layer_range[0] if layer_range else 0
++    layer_indices = list(range(start, end))
++
++    accumulators = {}
++    handles = register_expert_hooks(
++        model,
++        layer_indices,
++        accumulators,
++        torch.device(args.accum_device),
++        dtype_map[args.accum_dtype],
++    )
++    try:
++        collect(
++            model,
++            samples,
++            layer_indices,
++            accumulators,
++            torch.device(args.accum_device),
++            dtype_map[args.accum_dtype],
++            args.batch_size,
++        )
++    finally:
++        for h in handles:
++            h.remove()
++
++    save(
++        args.output_dir,
++        layer_indices,
++        accumulators,
++        save_inv=not args.no_inv,
++        damp=args.damp,
++        model_name=args.model,
++        extra_meta={
++            "dataset": args.data_path or args.dataset,
++            "nsamples": int(samples.shape[0]),
++            "seqlen": args.seqlen,
++            "seed": args.seed,
++        },
++    )
++    logger.info("done. Hessians written to %s", args.output_dir)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.34.1
+
+
+From 51237d0cb6b59794c03b7ded2f8737aba5eea9cf Mon Sep 17 00:00:00 2001
+From: Teka <alXeg_FGVkincCQp.Teka@noreply.gitcode.com>
+Date: Wed, 21 Oct 2026 15:40:35 +0800
+Subject: [PATCH 2/3] =?UTF-8?q?=E4=B8=93=E5=AE=B6=E9=87=8F=E5=8C=96?=
+ =?UTF-8?q?=E5=A2=9E=E5=BC=BA=EF=BC=9A=E9=80=90=E7=9F=A9=E9=98=B5=20tile?=
+ =?UTF-8?q?=20=E9=85=8D=E7=BD=AE=20+=20wrap-rotation=20+=20=E9=87=87?=
+ =?UTF-8?q?=E9=9B=86=E5=85=8D=20logits?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- vq.py QuantizedWeight 自描述化：group_num/row_tile/wrap 随产物落盘，
+  rebuild 逐矩阵读取，per-matrix 配置与 step2/3 flag 失配都不再踩坑
+- run_qwen36：--down-group-num/--down-row-tile（down 列宽对齐 32，
+  消除 4x 摊销差，全矩阵统一 32x32 tile=2.25bit）；新增
+  --wrap-rotation（W@R 量化、Hessian R^T H R、Q@R^T 转回）
+- hessian_io：wrap 模式不再依赖 4096 维 rotation 文件，按输入维
+  派生 seed-0 Hadamard（qwen hidden=2048/inter=512 各自独立）
+- rebuild_qwen36：--wrap-rotation 转回 + 产物 wrap 标志优先
+- collect_hessian：只跑 text backbone 不进 lm_head——整表 logits
+  (4,4096,248320)bf16≈7.6GB 被 accelerate hook 搬回输入卡，正是
+  shard 8:16 OOM 的 7.58GiB 分配；另关 text_config.use_cache
+- 脚本：WRAP_ROTATION 开关切换 -wrap 目录后缀与参数
+- CPU 冒烟：/tmp/smoke_qwen36.py（原路径回归）+
+  /tmp/smoke_qwen36_wrap.py（wrap 全链路，rel err 0.286 vs 无转回 1.408）
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ quantize_qwen36_experts.sh            | 32 ++++++---
+ vptq/tools/quantize/hessian_io.py     |  9 ++-
+ vptq/tools/quantize/rebuild_qwen36.py | 53 +++++++++++++--
+ vptq/tools/quantize/run_qwen36.py     | 98 +++++++++++++++++++++++++--
+ vptq/tools/quantize/vq.py             | 17 +++++
+ vptq/tools/qwen36/collect_hessian.py  | 14 +++-
+ 6 files changed, 199 insertions(+), 24 deletions(-)
+
+diff --git a/quantize_qwen36_experts.sh b/quantize_qwen36_experts.sh
+index 90665c9..e6e494d 100755
+--- a/quantize_qwen36_experts.sh
++++ b/quantize_qwen36_experts.sh
+@@ -37,9 +37,17 @@ export MALLOC_ARENA_MAX=4
+ CKPT=/home/l50062354/models/Qwen3.6-35B-A3B
+ CALIB_DATA=/home/l50062354/datasets/calib_corpus_R9tau.jsonl
+ BASE=/home/l50062354/vptq_qwen36
+-HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt
+-QUANT_DIR=$BASE/quant-tile32x16    # Step2 产物: quant_layer_XXXX_e*_e*.pt
+-OUT_DIR=$BASE/hf-vptq-tile32x16-bf16  # Step3 产物: 可部署 checkpoint 副本
++
++# wrap-rotation（QuaRot 式预旋转）：量化 W@R（seed-0 符号 Hadamard，
++# Hessian 同步 R^T H R），重建时 @R^T 转回原坐标，部署侧无感。开关
++# 会切换产物目录后缀——不同方案不共用 .parts，避免续跑混产物。
++WRAP_ROTATION=1
++WRAP_TAG=""; [ "$WRAP_ROTATION" -eq 1 ] && WRAP_TAG="-wrap"
++WRAP_FLAG=""; [ "$WRAP_ROTATION" -eq 1 ] && WRAP_FLAG="--wrap-rotation"
++
++HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt（与旋转无关，两方案共用）
++QUANT_DIR=$BASE/quant-tile32x32$WRAP_TAG    # Step2 产物: quant_layer_XXXX_e*_e*.pt
++OUT_DIR=$BASE/hf-vptq-tile32x32$WRAP_TAG-bf16  # Step3 产物: 可部署 checkpoint 副本
+ 
+ N_LAYERS=40                        # text_config.num_hidden_layers
+ N_EXPERTS=256                      # text_config.num_experts
+@@ -93,8 +101,14 @@ fi
+ 
+ # =============================================================================
+ # Step 2: 量化（4 卡并行，每卡 64 专家 × 40 层）
+-#   tile 方案 ≈2.66bit/权重；产物 quant_layer_XXXX_e{e0}_{e1}.pt +
+-#   quant_report.json（proxy_error 为质量首要指标）
++#   tile 方案（2026-10-21 起列宽对齐）: 全部矩阵 32列×32行 tile，码本摊销
++#   0.25 bit/权重 + 索引 2.0 = 2.25 bit/权重
++#   （gate/up g=64 → 2048/64=32 列宽；down g=16 → 512/16=32 列宽，
++#     消除 down 的 4 倍摊销差）
++#   WRAP_ROTATION=1 时叠加 --wrap-rotation：量化 W@R（Hadamard 高斯化，
++#   Hessian 同步旋转），rebuild @R^T 转回，部署权重坐标不变
++#   产物 quant_layer_XXXX_e{e0}_{e1}.pt + quant_report.json
++#   （proxy_error 为质量首要指标）
+ # =============================================================================
+ if [ "$DO_STEP2" -eq 1 ]; then
+     mkdir -p "$QUANT_DIR"
+@@ -107,7 +121,8 @@ if [ "$DO_STEP2" -eq 1 ]; then
+             --hessian-dir "$HESS_DIR" \
+             --output-dir "$QUANT_DIR" \
+             --vector-len 2 --num-centroids 16 --num-res-centroids -1 \
+-            --row-tile 16 --centroid-fp8 --group-num 128 --kmeans-iters 5 \
++            --row-tile 32 --centroid-fp8 --group-num 64 --down-group-num 16 \
++            --kmeans-iters 5 $WRAP_FLAG \
+             --device npu --layer-range "0:$N_LAYERS" \
+             --expert-range "$e0:$e1" \
+             --hidden-size 2048 --moe-intermediate 512 \
+@@ -129,11 +144,12 @@ if [ "$DO_STEP3" -eq 1 ]; then
+     echo "[step3] pass1: rebuild 打包 3D 权重..."
+     python3 -m vptq.tools.quantize.rebuild_qwen36 \
+         --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
+-        --layer-range "0:$N_LAYERS" --group-num 128 --row-tile 16 --device npu
++        --layer-range "0:$N_LAYERS" --group-num 64 --row-tile 32 \
++        $WRAP_FLAG --device npu
+     echo "[step3] pass2: assemble 装配部署权重..."
+     python3 -m vptq.tools.quantize.rebuild_qwen36 \
+         --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
+-        --layer-range "0:$N_LAYERS" --group-num 128 --row-tile 16 --device npu \
++        --layer-range "0:$N_LAYERS" --group-num 64 --row-tile 32 --device npu \
+         --assemble
+     echo "[step3] 全部完成: $OUT_DIR"
+ fi
+diff --git a/vptq/tools/quantize/hessian_io.py b/vptq/tools/quantize/hessian_io.py
+index b0475d6..f0a3225 100644
+--- a/vptq/tools/quantize/hessian_io.py
++++ b/vptq/tools/quantize/hessian_io.py
+@@ -174,9 +174,14 @@ class HessianStore:
+             )
+             return torch.eye(n), None
+         H, inv = entry["hessian"], entry.get("inv_hessian")
+-        if self.R is not None and is_rotated_group(group_key, wrap=self.wrap):
++        # wrap 模式可以不依赖 rotation 文件：R 一律按输入维派生
++        # (wrap_rotation(dim, seed=0)，跨进程逐位一致)。DSV4 的 wrap 走
++        # 文件 R 校验路径（self.R 非 None），行为不变。
++        if (
++            self.R is not None or self.wrap
++        ) and is_rotated_group(group_key, wrap=self.wrap):
+             R = self.R
+-            if self.wrap and H.shape[-1] != R.shape[0]:
++            if self.wrap and (R is None or H.shape[-1] != R.shape[0]):
+                 # wrap mode: per-input-dim rotation (w2's 2048-d SwiGLU
+                 # intermediate gets its own Hadamard; seed-0 4096 matches
+                 # the rotation file's global_rotation).
+diff --git a/vptq/tools/quantize/rebuild_qwen36.py b/vptq/tools/quantize/rebuild_qwen36.py
+index 9f1a991..e30fc84 100644
+--- a/vptq/tools/quantize/rebuild_qwen36.py
++++ b/vptq/tools/quantize/rebuild_qwen36.py
+@@ -29,6 +29,7 @@ import os
+ import torch
+ from safetensors.torch import save_file
+ 
++from vptq.tools.quantize.hadamard import wrap_rotation
+ from vptq.tools.quantize.rebuild_bf16 import (
+     load_layer_quant,
+     pass_assemble,
+@@ -68,8 +69,37 @@ def _fold_scales(qw, Q, out_f, in_f):
+     return Q
+ 
+ 
++def _wrap_back(qw, Q, in_f, cli_wrap):
++    """Undo --wrap-rotation: stored weight is Q(W @ R) in the rotated
++    input basis; multiply back with R^T (signed Hadamard R is orthogonal
++    but NOT symmetric). The artifact's own wrap flag wins; the CLI flag
++    only covers old artifacts written before the field existed.
++    """
++    w = getattr(qw, "wrap", None)
++    if not (cli_wrap if w is None else w):
++        return Q
++    R = wrap_rotation(in_f)
++    return (Q.float() @ R.t().to(Q.device)).to(Q.dtype)
++
++
+ @torch.no_grad()
+ def pass_rebuild_qwen(args):
++    def geom(qw):
++        """Per-matrix tile geometry: trust the artifact, fall back to CLI.
++
++        Newer QuantizedWeights carry the group_num/row_tile they were
++        quantized with (possibly per-matrix, e.g. down's own group_num);
++        old artifacts lack the fields (getattr -> None) and use the CLI.
++        row_tile=0 (no tiling) is a legitimate stored value, so only
++        None falls back — `or` would clobber it.
++        """
++        g = getattr(qw, "group_num", None)
++        r = getattr(qw, "row_tile", None)
++        return (
++            g if g else args.group_num,
++            args.row_tile if r is None else r,
++        )
++
+     with open(os.path.join(args.ckpt, "model.safetensors.index.json")) as f:
+         wmap = json.load(f)["weight_map"]
+     prefix = detect_layer_prefix(wmap)
+@@ -98,23 +128,24 @@ def pass_rebuild_qwen(args):
+         down = torch.empty(n_experts, dn_out, inter, dtype=torch.float32)
+         for e in range(n_experts):
+             qg = reconstruct_weight(
+-                quant[f"experts.{e}.gate"],
+-                args.group_num,
+-                args.row_tile,
+-                device,
++                quant[f"experts.{e}.gate"], *geom(quant[f"experts.{e}.gate"]), device
+             )
+             qu = reconstruct_weight(
+-                quant[f"experts.{e}.up"], args.group_num, args.row_tile, device
++                quant[f"experts.{e}.up"], *geom(quant[f"experts.{e}.up"]), device
+             )
+             qd = reconstruct_weight(
+                 quant[f"experts.{e}.down"],
+-                args.group_num,
+-                args.row_tile,
++                *geom(quant[f"experts.{e}.down"]),
+                 device,
+             )
+             qg = _fold_scales(quant[f"experts.{e}.gate"], qg, inter, hidden)
+             qu = _fold_scales(quant[f"experts.{e}.up"], qu, inter, hidden)
+             qd = _fold_scales(quant[f"experts.{e}.down"], qd, hidden, inter)
++            # wrap-rotation 转回在 scale 折回之后：col_scale 是旋转基下的
++            # 对角缩放，不能穿过 R^T
++            qg = _wrap_back(quant[f"experts.{e}.gate"], qg, hidden, args.wrap_rotation)
++            qu = _wrap_back(quant[f"experts.{e}.up"], qu, hidden, args.wrap_rotation)
++            qd = _wrap_back(quant[f"experts.{e}.down"], qd, inter, args.wrap_rotation)
+             # 行序即 Qwen3_5MoeExperts.forward 的 chunk 顺序：[0:inter]=gate
+             gate_up[e] = torch.cat([qg[:inter], qu[:inter]], 0).float()
+             down[e] = qd[:hidden].float()
+@@ -139,6 +170,14 @@ def main():
+     p.add_argument("--group-num", type=int, default=128)
+     p.add_argument("--row-tile", type=int, default=256)
+     p.add_argument("--device", default="npu")
++    p.add_argument(
++        "--wrap-rotation",
++        action="store_true",
++        help="Rotate Q(W @ R) weights back with @ R^T (run_qwen36 "
++        "--wrap-rotation). Only needed for old artifacts written "
++        "before the per-matrix wrap flag; newer artifacts "
++        "self-describe and rotate back automatically.",
++    )
+     p.add_argument("--assemble", action="store_true")
+     args = p.parse_args()
+     args.parts_dir = os.path.join(args.output_dir, "expert_parts")
+diff --git a/vptq/tools/quantize/run_qwen36.py b/vptq/tools/quantize/run_qwen36.py
+index ff03914..162bf90 100644
+--- a/vptq/tools/quantize/run_qwen36.py
++++ b/vptq/tools/quantize/run_qwen36.py
+@@ -37,10 +37,12 @@ import argparse
+ import json
+ import logging
+ import os
++from dataclasses import replace
+ 
+ import torch
+ 
+ from vptq.tools.quantize.config import QuantConfig
++from vptq.tools.quantize.hadamard import right_rot, wrap_rotation
+ from vptq.tools.quantize.hessian_io import HessianStore
+ from vptq.tools.quantize.run import PartsStaging, WeightStore
+ from vptq.tools.quantize.vq import (
+@@ -80,11 +82,24 @@ def quantize_expert(
+     down_e: torch.Tensor,
+     store: HessianStore,
+     config: QuantConfig,
++    down_config: QuantConfig,
+     device: torch.device,
++    wrap: bool = False,
+ ) -> dict:
+     """Quantize one expert -> {short: QuantizedWeight}.
+ 
+     gate_up_e: (2*inter, hidden); down_e: (hidden, inter).
++
++    gate/up share `config` (same shape, same mlp_in Hessian, one batched
++    kmeans); down is quantized with `down_config`, which may override
++    group_num/row_tile to compensate for its smaller in_features.
++
++    wrap=True (--wrap-rotation): every matrix is input-side wrapped —
++    quantize V = W @ R with R = wrap_rotation(in) (seed-0 signed
++    Hadamard; the store rotates H/inv to R^T H R in step) — and the
++    QuantizedWeight.wrap flag tells rebuild to rotate back with
++    Q @ R^T. Deployment stays in the original basis; the rotation only
++    Gaussianizes what the VQ codebooks see.
+     """
+     inter = gate_up_e.shape[0] // 2
+     hess_key_in = f"mlp.experts.{e}.mlp_in"
+@@ -94,6 +109,11 @@ def quantize_expert(
+     # （与 run.py 的 w1+w3 joint 同构，vptq_quantize_joint 要求同形状）
+     Wg = gate_up_e[:inter].float()
+     Wu = gate_up_e[inter:].float()
++    Wd = down_e.float()
++    if wrap:
++        Wg = right_rot(Wg, wrap_rotation(gate_up_e.shape[1]))
++        Wu = right_rot(Wu, wrap_rotation(gate_up_e.shape[1]))
++        Wd = right_rot(Wd, wrap_rotation(Wd.shape[1]))
+     hessian_in, _ = store.get(layer_idx, hess_key_in)
+     HinvU_in = store.cholesky_upper(layer_idx, hess_key_in, damp=config.damp)
+     qw_g, qw_u = vptq_quantize_joint(
+@@ -115,13 +135,14 @@ def quantize_expert(
+     out[f"experts.{e}.gate"] = qw_g
+     out[f"experts.{e}.up"] = qw_u
+ 
+-    Wd = down_e.float()
+     hessian_dn, _ = store.get(layer_idx, hess_key_dn)
+-    HinvU_dn = store.cholesky_upper(layer_idx, hess_key_dn, damp=config.damp)
++    HinvU_dn = store.cholesky_upper(
++        layer_idx, hess_key_dn, damp=down_config.damp
++    )
+     qw_d = vptq_quantize(
+         Wd,
+         hessian_dn.float(),
+-        config,
++        down_config,
+         device=device,
+         hessian_inv_upper=HinvU_dn,
+         kmeans_seed=hash(f"layers.{layer_idx}.experts.{e}.down") & 0xFFFF,
+@@ -135,6 +156,10 @@ def quantize_expert(
+         qw_d.mse,
+     )
+     out[f"experts.{e}.down"] = qw_d
++    if wrap:
++        # 自描述：rebuild 按 per-matrix 标志转回，混合/续跑产物也不会错配
++        for qw in out.values():
++            qw.wrap = True
+     return out
+ 
+ 
+@@ -172,6 +197,34 @@ def main():
+         default=None,
+         help="Local NVMe dir to stage quant parts (perf on NFS).",
+     )
++    p.add_argument(
++        "--down-group-num",
++        type=int,
++        default=None,
++        help="Column-group override for down_proj. Its in_features is "
++        "moe_intermediate (512), so the same --group-num yields 4-col "
++        "tiles vs gate/up's 16-col and 4x codebook amortization; pass "
++        "e.g. 32 to align column width (512/32 = 16). Default: same "
++        "as --group-num.",
++    )
++    p.add_argument(
++        "--down-row-tile",
++        type=int,
++        default=None,
++        help="Row-tile override for down_proj. Default: same as "
++        "--row-tile.",
++    )
++    p.add_argument(
++        "--wrap-rotation",
++        action="store_true",
++        help="Quantize every matrix as V = W @ R (R = wrap_rotation(in), "
++        "seed-0 signed Hadamard; Hessians rotated to R^T H R in the "
++        "store). Spreads outliers so the tiny VQ codebooks fit better; "
++        "rebuild_qwen36 --wrap-rotation rotates back with Q @ R^T. "
++        "Deployment weights stay in the original basis. QuantizedWeight."
++        "wrap records it per matrix, so rebuild stays correct even for "
++        "mixed/resumed artifacts.",
++    )
+     args = p.parse_args()
+ 
+     config = QuantConfig(
+@@ -185,6 +238,26 @@ def main():
+         centroid_fp8=args.centroid_fp8,
+     )
+     logger.info("config: %s (%.3f bits/weight)", config, config.bits_per_weight)
++    down_config = config
++    if args.down_group_num is not None or args.down_row_tile is not None:
++        down_config = replace(
++            config,
++            group_num=(
++                args.down_group_num
++                if args.down_group_num is not None
++                else config.group_num
++            ),
++            row_tile=(
++                args.down_row_tile
++                if args.down_row_tile is not None
++                else config.row_tile
++            ),
++        )
++        logger.info(
++            "down config: %s (%.3f bits/weight)",
++            down_config,
++            down_config.bits_per_weight,
++        )
+     device = torch.device(args.device)
+ 
+     def identity_dims(group_key: str) -> int:
+@@ -196,7 +269,18 @@ def main():
+ 
+     weights = WeightStore(args.ckpt)
+     prefix = detect_layer_prefix(weights.weight_map)
+-    store = HessianStore(args.hessian_dir, identity_dims=identity_dims)
++    store = HessianStore(
++        args.hessian_dir,
++        wrap=args.wrap_rotation,
++        identity_dims=identity_dims,
++    )
++    if args.wrap_rotation:
++        logger.info(
++            "wrap-rotation ON: W -> W @ R per input dim "
++            "(hidden=%d via mlp_in, inter=%d via down_proj)",
++            args.hidden_size,
++            args.moe_intermediate,
++        )
+     staging = None
+     if args.save_staging:
+         staging = PartsStaging(args.save_staging)
+@@ -267,7 +351,9 @@ def main():
+                 down[e],
+                 store,
+                 config,
++                down_config,
+                 device,
++                wrap=args.wrap_rotation,
+             )
+             out.update(new)
+             for s, qw in new.items():
+@@ -304,7 +390,11 @@ def main():
+         "num_centroids": config.num_centroids,
+         "num_res_centroids": config.num_res_centroids,
+         "group_num": config.group_num,
++        "row_tile": config.row_tile,
+         "bits_per_weight": config.bits_per_weight,
++        "down_group_num": down_config.group_num,
++        "down_row_tile": down_config.row_tile,
++        "wrap_rotation": args.wrap_rotation,
+         "model": "qwen3_5_moe-packed-experts",
+     }
+     with open(report_path, "w") as f:
+diff --git a/vptq/tools/quantize/vq.py b/vptq/tools/quantize/vq.py
+index a144bd1..f75fe90 100644
+--- a/vptq/tools/quantize/vq.py
++++ b/vptq/tools/quantize/vq.py
+@@ -44,6 +44,19 @@ class QuantizedWeight:
+     # multiplies them back (row left, col right). None = not normalized.
+     row_scale: Optional[torch.Tensor] = None  # (out,) rms per row
+     col_scale: Optional[torch.Tensor] = None  # (in,) rms per column
++    # tile geometry this weight was quantized with (self-describing
++    # artifact): rebuild reads these per matrix instead of trusting CLI
++    # flags, so per-matrix configs (e.g. down's own group_num) and
++    # step2/step3 flag mismatches are both handled. Absent in older
++    # artifacts — readers fall back to CLI via getattr.
++    group_num: int = 1
++    row_tile: int = 0
++    # wrap-rotation self-description: this weight was quantized as
++    # V = W @ R (R = wrap_rotation(in), seed-0 signed Hadamard), so
++    # rebuild must rotate back with Q @ R^T (R is orthogonal, not
++    # symmetric). False for unwrapped weights; absent in older
++    # artifacts — readers fall back to CLI via getattr.
++    wrap: bool = False
+ 
+ 
+ @torch.no_grad()
+@@ -712,6 +725,8 @@ def vptq_quantize(
+         ),
+         proxy_error=proxy.item(),
+         mse=mse.item(),
++        group_num=config.group_num,
++        row_tile=config.row_tile,
+     )
+ 
+ 
+@@ -834,6 +849,8 @@ def vptq_quantize_joint(
+                 ),
+                 proxy_error=proxy.item(),
+                 mse=mse.item(),
++                group_num=config.group_num,
++                row_tile=config.row_tile,
+             )
+         )
+     return outs
+diff --git a/vptq/tools/qwen36/collect_hessian.py b/vptq/tools/qwen36/collect_hessian.py
+index 8f9129c..4c81a31 100644
+--- a/vptq/tools/qwen36/collect_hessian.py
++++ b/vptq/tools/qwen36/collect_hessian.py
+@@ -186,15 +186,23 @@ def collect(
+ ):
+     was_training = model.training
+     model.eval()
+-    if hasattr(model.config, "use_cache"):
+-        model.config.use_cache = False
++    # KV cache 全程无用；text_config 与顶层 config 是两份配置，都关掉
++    for cfg in (getattr(model.config, "text_config", None), model.config):
++        if cfg is not None and hasattr(cfg, "use_cache"):
++            cfg.use_cache = False
+     try:
+         input_device = model.get_input_embeddings().weight.device
+     except AttributeError:
+         input_device = next(model.parameters()).device
++    # 只跑 text backbone，不进 lm_head：ForConditionalGeneration 的完整
++    # forward 会对全部位置算 logits (4, 4096, 248320) bf16 ≈ 7.6GB，再被
++    # accelerate 的 post-forward hook 搬回输入卡 —— shard 8:16 正是这笔
++    # 7.58GiB 分配把 NPU 0 顶爆的；Hessian 采集用不到 logits。
++    inner = getattr(model, "model", model)
++    text_model = getattr(inner, "language_model", inner)
+     for start in range(0, samples.shape[0], batch_size):
+         ids = samples[start : start + batch_size].to(input_device)
+-        model(input_ids=ids)
++        text_model(input_ids=ids)
+         done = min(start + batch_size, samples.shape[0])
+         logger.info("processed %d/%d samples", done, samples.shape[0])
+     if was_training:
+-- 
+2.34.1
+
+
+From d317c9f6763dc9cd39d54fea648c6cefb0b8cb16 Mon Sep 17 00:00:00 2001
+From: Teka <alXeg_FGVkincCQp.Teka@noreply.gitcode.com>
+Date: Wed, 21 Oct 2026 15:59:48 +0800
+Subject: [PATCH 3/3] =?UTF-8?q?=E8=84=9A=E6=9C=AC=E7=AE=80=E5=8C=96?=
+ =?UTF-8?q?=EF=BC=9A=E5=8E=BB=E6=8E=89=20WRAP=5FROTATION=20=E5=BC=80?=
+ =?UTF-8?q?=E5=85=B3/--wrap=20=E5=90=8E=E7=BC=80=E6=8B=BC=E6=8E=A5?=
+ =?UTF-8?q?=EF=BC=8C=E7=9B=B4=E6=8E=A5=E5=86=99=20--wrap-rotation?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+产物目录写死 quant-tile32x32-wrap / hf-vptq-tile32x32-wrap-bf16，
+与既有无 wrap 产物（quant-tile32x32）天然隔离。
+
+Co-Authored-By: Claude Code <noreply@anthropic.com>
+---
+ quantize_qwen36_experts.sh | 22 +++++++---------------
+ 1 file changed, 7 insertions(+), 15 deletions(-)
+
+diff --git a/quantize_qwen36_experts.sh b/quantize_qwen36_experts.sh
+index e6e494d..daabbdd 100755
+--- a/quantize_qwen36_experts.sh
++++ b/quantize_qwen36_experts.sh
+@@ -37,17 +37,9 @@ export MALLOC_ARENA_MAX=4
+ CKPT=/home/l50062354/models/Qwen3.6-35B-A3B
+ CALIB_DATA=/home/l50062354/datasets/calib_corpus_R9tau.jsonl
+ BASE=/home/l50062354/vptq_qwen36
+-
+-# wrap-rotation（QuaRot 式预旋转）：量化 W@R（seed-0 符号 Hadamard，
+-# Hessian 同步 R^T H R），重建时 @R^T 转回原坐标，部署侧无感。开关
+-# 会切换产物目录后缀——不同方案不共用 .parts，避免续跑混产物。
+-WRAP_ROTATION=1
+-WRAP_TAG=""; [ "$WRAP_ROTATION" -eq 1 ] && WRAP_TAG="-wrap"
+-WRAP_FLAG=""; [ "$WRAP_ROTATION" -eq 1 ] && WRAP_FLAG="--wrap-rotation"
+-
+-HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt（与旋转无关，两方案共用）
+-QUANT_DIR=$BASE/quant-tile32x32$WRAP_TAG    # Step2 产物: quant_layer_XXXX_e*_e*.pt
+-OUT_DIR=$BASE/hf-vptq-tile32x32$WRAP_TAG-bf16  # Step3 产物: 可部署 checkpoint 副本
++HESS_DIR=$BASE/hessians            # Step1 产物: layer_XXXX.pt（与旋转无关）
++QUANT_DIR=$BASE/quant-tile32x32-wrap    # Step2 产物（--wrap-rotation 版）
++OUT_DIR=$BASE/hf-vptq-tile32x32-wrap-bf16  # Step3 产物: 可部署 checkpoint 副本
+ 
+ N_LAYERS=40                        # text_config.num_hidden_layers
+ N_EXPERTS=256                      # text_config.num_experts
+@@ -105,8 +97,8 @@ fi
+ #   0.25 bit/权重 + 索引 2.0 = 2.25 bit/权重
+ #   （gate/up g=64 → 2048/64=32 列宽；down g=16 → 512/16=32 列宽，
+ #     消除 down 的 4 倍摊销差）
+-#   WRAP_ROTATION=1 时叠加 --wrap-rotation：量化 W@R（Hadamard 高斯化，
+-#   Hessian 同步旋转），rebuild @R^T 转回，部署权重坐标不变
++#   --wrap-rotation：量化 W@R（Hadamard 高斯化，Hessian 同步旋转），
++#   rebuild @R^T 转回，部署权重坐标不变
+ #   产物 quant_layer_XXXX_e{e0}_{e1}.pt + quant_report.json
+ #   （proxy_error 为质量首要指标）
+ # =============================================================================
+@@ -122,7 +114,7 @@ if [ "$DO_STEP2" -eq 1 ]; then
+             --output-dir "$QUANT_DIR" \
+             --vector-len 2 --num-centroids 16 --num-res-centroids -1 \
+             --row-tile 32 --centroid-fp8 --group-num 64 --down-group-num 16 \
+-            --kmeans-iters 5 $WRAP_FLAG \
++            --kmeans-iters 5 --wrap-rotation \
+             --device npu --layer-range "0:$N_LAYERS" \
+             --expert-range "$e0:$e1" \
+             --hidden-size 2048 --moe-intermediate 512 \
+@@ -145,7 +137,7 @@ if [ "$DO_STEP3" -eq 1 ]; then
+     python3 -m vptq.tools.quantize.rebuild_qwen36 \
+         --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
+         --layer-range "0:$N_LAYERS" --group-num 64 --row-tile 32 \
+-        $WRAP_FLAG --device npu
++        --wrap-rotation --device npu
+     echo "[step3] pass2: assemble 装配部署权重..."
+     python3 -m vptq.tools.quantize.rebuild_qwen36 \
+         --ckpt "$CKPT" --quant-dir "$QUANT_DIR" --output-dir "$OUT_DIR" \
+-- 
+2.34.1
+
