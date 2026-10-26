@@ -126,22 +126,24 @@ class HessianStore:
         self._cache: Optional[Dict[str, dict]] = None
         self.R: Optional[torch.Tensor] = None
         if rotation_path:
-            from safetensors.torch import load_file
-
-            self.R = load_file(rotation_path)["global_rotation"].float()
-            logger.info("Hadamard rotation loaded from %s", rotation_path)
             if self.wrap:
-                # wrap 模式按输入维派生 R（hadamard_matrix(dim, seed=0)）；
-                # 文件 R 用于 4096 维组，必须与派生结果逐位一致，
-                # 否则 W 侧与 H 侧的旋转会错配。
+                # 2026-10-12 起 wrap 模式 R 为分块随机 Hadamard（块 32，
+                # hadamard.wrap_rotation 派生），与 W 侧 run.py maybe_wrap /
+                # rebuild 折回共用同一派生源；rotation 文件仅作为启用旋转的
+                # 开关（其 global_rotation 是旧全局版，不再断言一致）。
                 from vptq.tools.quantize.hadamard import wrap_rotation
 
-                derived = wrap_rotation(self.R.shape[0])
-                assert torch.allclose(self.R, derived, atol=1e-5), (
-                    "wrap mode requires the rotation file to be the "
-                    "seed-0 signed Hadamard (hadamard_matrix(dim, 0)); "
-                    "other R families need explicit per-dim artifacts"
+                self.R = wrap_rotation(4096)
+                logger.info(
+                    "wrap mode: derived block-Hadamard R (block=%d) for "
+                    "4096-d groups; rotation file %s used as switch only",
+                    32, rotation_path,
                 )
+            else:
+                from safetensors.torch import load_file
+
+                self.R = load_file(rotation_path)["global_rotation"].float()
+                logger.info("Hadamard rotation loaded from %s", rotation_path)
 
     def _load(self, layer_idx: int) -> Dict[str, dict]:
         if self._cache_idx != layer_idx:
@@ -177,17 +179,15 @@ class HessianStore:
         # wrap 模式可以不依赖 rotation 文件：R 一律按输入维派生
         # (wrap_rotation(dim, seed=0)，跨进程逐位一致)。DSV4 的 wrap 走
         # 文件 R 校验路径（self.R 非 None），行为不变。
-        if (
-            self.R is not None or self.wrap
-        ) and is_rotated_group(group_key, wrap=self.wrap):
+        if self.R is not None and is_rotated_group(group_key, wrap=self.wrap):
             R = self.R
-            if self.wrap and (R is None or H.shape[-1] != R.shape[0]):
-                # wrap mode: per-input-dim rotation (w2's 2048-d SwiGLU
-                # intermediate gets its own Hadamard; seed-0 4096 matches
-                # the rotation file's global_rotation).
+            if self.wrap:
+                # wrap 模式：按输入维统一派生分块 R（4096 与 w2 的 2048），
+                # 与 W 侧同一来源，杜绝两侧错配。
                 from vptq.tools.quantize.hadamard import wrap_rotation
-
                 R = wrap_rotation(H.shape[-1])
+            else:
+                R = self.R
             H = R.t() @ H.float() @ R
             if inv is not None:
                 inv = R.t() @ inv.float() @ R

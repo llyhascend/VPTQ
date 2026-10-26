@@ -1,0 +1,129 @@
+{
+    "binFileName": "Add_BFLOAT16_high_performance",
+    "binFileSuffix": ".o",
+    "blockDim": -1,
+    "coreType": "VectorCore",
+    "core_type": "AIV",
+    "intercoreSync": 0,
+    "kernelName": "Add_BFLOAT16_high_performance",
+    "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+    "memoryStamping": [],
+    "opParaSize": 640,
+    "parameters": [
+        null,
+        null,
+        null,
+        null
+    ],
+    "sha256": "7ea7fb6a014d42b4398a59f0f3eb6d1be278b9bc7bd88cadf48bf6fe0e7f9d3d",
+    "workspace": {
+        "num": 1,
+        "size": [
+            -1
+        ],
+        "type": [
+            0
+        ]
+    },
+    "kernelList": [
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_0"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_1"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_2"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_3"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_4"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_5"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_6"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_7"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_8"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_9"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_10"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_11"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_12"
+        },
+        {
+            "kernelName": "Add_BFLOAT16_high_performance_13"
+        }
+    ],
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "supportSuperKernel": 1,
+    "compileInfo": {},
+    "supportInfo": {
+        "implMode": "high_performance",
+        "int64Mode": false,
+        "simplifiedKeyMode": 0,
+        "simplifiedKey": [
+            "Add/d=0,p=1/27,2/27,2/27,2",
+            "Add/d=0,p=0/27,2/27,2/27,2",
+            "Add/d=1,p=1/27,2/27,2/27,2",
+            "Add/d=1,p=0/27,2/27,2/27,2"
+        ],
+        "optionalInputMode": "gen_placeholder",
+        "optionalOutputMode": "gen_placeholder",
+        "staticKey": "dc766b3952a8be4cb1221b9c67110c5690e3531f95681a731cf9778a603d5cf2,6e574c20a066b3f7d982ef281c86da7d13b377e29fbd1bc09f34b574cf29a16b",
+        "inputs": [
+            {
+                "name": "x1",
+                "index": 0,
+                "dtype": "bfloat16",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ],
+                "format_match_mode": "FormatAgnostic"
+            },
+            {
+                "name": "x2",
+                "index": 1,
+                "dtype": "bfloat16",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ],
+                "format_match_mode": "FormatAgnostic"
+            }
+        ],
+        "outputs": [
+            {
+                "name": "y",
+                "index": 0,
+                "dtype": "bfloat16",
+                "format": "ND",
+                "paramType": "required",
+                "shape": [
+                    -2
+                ],
+                "format_match_mode": "FormatAgnostic"
+            }
+        ],
+        "opMode": "dynamic",
+        "deterministic": "ignore"
+    }
+}

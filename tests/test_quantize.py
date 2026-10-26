@@ -28,7 +28,7 @@ def _config(**kw):
         vector_len=8,
         num_centroids=64,
         num_res_centroids=16,
-        group_num=2,
+        col_tile=24,  # in_f=48 -> 2 groups (was group_num=2)
         kmeans_iters=4,
     )
     base.update(kw)
@@ -45,11 +45,12 @@ def test_build_vqlinear_dequant_matches_reference():
     from vptq import ops
 
     v = cfg.vector_len
+    g_eff = W.shape[1] // cfg.col_tile
     centroids3 = layer.centroids.weight.view(
-        cfg.group_num, cfg.num_centroids, v
+        g_eff, cfg.num_centroids, v
     )
     res_centroids3 = layer.res_centroids.weight.view(
-        cfg.group_num, cfg.num_res_centroids, v
+        g_eff, cfg.num_res_centroids, v
     )
     qweight = ops.dequant(
         indices=layer.indices,
@@ -71,8 +72,8 @@ def test_build_vqlinear_dequant_matches_reference():
         num_res_centroids=cfg.num_res_centroids,
         padding=layer.padding,
         outlier_padding=0,
-        num_codebooks=cfg.group_num,
-        group_size=W.shape[1] // cfg.group_num,
+        num_codebooks=g_eff,
+        group_size=cfg.col_tile,
         outlier_size=0,
         vector_len=cfg.vector_len,
         outlier_vector_len=-1,
@@ -94,8 +95,8 @@ def test_packed_indices_roundtrip():
 
     index_bits = int(math.log2(cfg.num_centroids))
     res_bits = int(math.log2(cfg.num_res_centroids))
-    group_size = W.shape[1] // cfg.group_num
-    for g in range(cfg.group_num):
+    group_size = cfg.col_tile
+    for g in range(W.shape[1] // cfg.col_tile):
         indice = qw.indices[g].t().contiguous().unsqueeze(0)  # (1,nvec,cols)
         res = qw.res_indices[g].t().contiguous().unsqueeze(0)
         packed = pack_index(
@@ -134,10 +135,11 @@ def test_tile_scheme_v2_k16_res8():
     W = torch.randn(out_f, in_f) * 0.05
 
     cfg = QuantConfig.v2_k16_res8_k16()
-    cfg.group_num = in_f // 32  # 32 列/组
+    cfg.col_tile = 32  # 32 列/组
     qw = vptq_quantize(W, H, cfg, device=torch.device("cpu"))
 
-    n_tiles = cfg.group_num * (out_f // 256)
+    g_eff = in_f // cfg.col_tile
+    n_tiles = g_eff * (out_f // 256)
     assert qw.centroids.shape == (n_tiles, 16, 2)
     assert qw.centroids.dtype == torch.float8_e4m3fn
     assert qw.res_centroids.shape == (n_tiles, 16, 8)
@@ -147,7 +149,7 @@ def test_tile_scheme_v2_k16_res8():
     # 重建 Ŵ（tile 布局）
     def reconstruct(qw, with_res=True):
         Q = torch.zeros(out_f, in_f)
-        for gi in range(cfg.group_num):
+        for gi in range(g_eff):
             for t in range(1):
                 tile = gi * 1 + t
                 cb = qw.centroids[tile].float()

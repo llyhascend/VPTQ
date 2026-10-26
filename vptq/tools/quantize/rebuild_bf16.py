@@ -65,14 +65,19 @@ def reconstruct_weight(qw, group_num: int, row_tile: int, device) -> torch.Tenso
         idx = idx.long().to(device)
         T, cols, nvec = idx.shape
         k, v = cents.shape[1], cents.shape[2]
+        # group_num is the per-matrix column-group count: with col_tile
+        # (2026-10-20) w2 (in_f=2048) stores 64 32-wide groups vs 128 for
+        # w1/w3; the caller passes in_f // cols so old artifacts (16-wide
+        # groups) read back correctly too.
+        gnum = group_num
         flat = cents.reshape(T * k, v)
         off = torch.arange(T, device=device).view(-1, 1, 1) * k
         g = flat[(idx + off).reshape(-1)].view(T, cols, nvec, v)
         g = g.permute(0, 2, 3, 1).reshape(T, nvec * v, cols)  # (T, span, cols)
-        n_row = T // group_num
-        g = g.view(group_num, n_row, nvec * v, cols)
-        g = g.permute(1, 2, 0, 3)  # (n_row, span, group_num, cols)
-        return g.reshape(n_row * (nvec * v), group_num * cols)
+        n_row = T // gnum
+        g = g.view(gnum, n_row, nvec * v, cols)
+        g = g.permute(1, 2, 0, 3)  # (n_row, span, gnum, cols)
+        return g.reshape(n_row * (nvec * v), gnum * cols)
 
     Q = expand(qw.centroids, qw.indices)
     if qw.res_centroids is not None:
@@ -148,10 +153,12 @@ def pass_rebuild(args):
             )
             if os.path.exists(out_path):
                 continue
-            Q = reconstruct_weight(
-                qw, args.group_num, args.row_tile, device
-            )
             out_f, in_f = wmap_shape(args.ckpt, wmap, full)
+            # per-matrix group count, self-describing from stored shapes:
+            # cols = in_f / groups (32 for col_tile runs, 16 for legacy
+            # w2 artifacts quantized under the global --group-num 128)
+            gnum = in_f // qw.indices.shape[1]
+            Q = reconstruct_weight(qw, gnum, args.row_tile, device)
             Q = Q[:out_f]
             # dual-scale normalization: multiply the stored scales back
             # (W_norm = W / s / d was quantized; here Ŵ = s ⊙ Q ⊙ d).
@@ -181,7 +188,46 @@ def pass_rebuild(args):
             done += 1
         logger.info("layer %d: rebuilt %d/%d experts", layer_idx, done,
                     len(quant))
+        if getattr(args, "fallback_mxfp4", False):
+            fb_done = _rebuild_fallback_mxfp4(
+                args, layer_idx, fb_full | fb_down, wmap, device)
+            logger.info("layer %d: fallback mxfp4 %d parts", layer_idx,
+                        fb_done)
         del quant
+
+
+def _rebuild_fallback_mxfp4(args, layer_idx, fb_keys, wmap, device):
+    """Pre-quantize fallback experts in wrap domain (2026-10-14).
+
+    part = mxfp4_ceilx_roundtrip(W @ R, 7.25) @ R^T, stored BF16;
+    assemble swaps it into the checkpoint, and the deploy yaml rule B
+    (method scale_one) performs the final e4m3 cast. R is the same
+    block-diagonal Hadamard (block=32, seed=0) as VPTQ expert wrap.
+    """
+    from vptq.tools.quantize.hadamard import wrap_rotation
+    from vptq.tools.quantize.mxfp4_ceilx import mxfp4_ceilx_roundtrip
+
+    done = 0
+    for li, short in sorted(fb_keys):
+        if li != layer_idx:
+            continue
+        full = f"layers.{li}.{short}"
+        if full not in wmap:
+            logger.warning("fallback not in checkpoint index: %s", full)
+            continue
+        out_path = os.path.join(args.parts_dir, full + ".safetensors")
+        if os.path.exists(out_path):
+            continue
+        shard = os.path.join(args.ckpt, wmap[full])
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            W = f.get_tensor(full).to(device)
+        R = wrap_rotation(W.shape[1]).to(device)
+        V = W.float() @ R
+        Vdq = mxfp4_ceilx_roundtrip(V)
+        part = (Vdq @ R.t()).to(torch.bfloat16).cpu().contiguous()
+        save_file({"w": part}, out_path)
+        done += 1
+    return done
 
 
 def wmap_shape(ckpt, wmap, name):
@@ -246,7 +292,11 @@ def main():
     p.add_argument("--ckpt", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--layer-range", default="0:43")
-    p.add_argument("--group-num", type=int, default=128)
+    p.add_argument(
+        "--group-num", type=int, default=128,
+        help="deprecated/unused: group count is inferred from "
+        "centroids.shape[0] (per-matrix since col_tile, 2026-10-20)",
+    )
     p.add_argument("--row-tile", type=int, default=256)
     p.add_argument("--device", default="npu")
     p.add_argument("--assemble", action="store_true")
@@ -255,6 +305,13 @@ def main():
         help="fallback_list.json (from vptq.tools.quantize.fallback_list): "
         "listed experts keep original BF16 (full: w1+w2+w3; down_only: w2) "
         "and go through msmodelslim's standard W4A8 path instead of VPTQ.",
+    )
+    p.add_argument(
+        "--fallback-mxfp4", action="store_true",
+        help="Pre-quantize fallback experts too: W @ R (block-diag Hadamard "
+        "block=32, seed=0) -> mxfp4 ceil_x(7.25) roundtrip -> @ R^T, stored "
+        "as BF16 parts. Requires the deploy yaml rule B to use scale_one "
+        "for the final e4m3 cast.",
     )
     p.add_argument(
         "--wrap-rotation",

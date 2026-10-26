@@ -555,6 +555,20 @@ def _tile_vecs_loop(M, bounds, spans, diag_h, v):
 
 
 @torch.no_grad()
+def _num_col_groups(config, in_f: int) -> int:
+    """Column groups at the configured ``col_tile`` width (2026-10-20).
+
+    ``config.col_tile`` is the column-block width itself (not a group
+    count): groups = ceil(in_f / col_tile), so every matrix -- w1/w3
+    (in_f=4096) and w2 (in_f=2048) alike -- gets the SAME tile geometry
+    (col_tile x row_tile, e.g. 32x32). col_tile<=0 means whole-row
+    single group (legacy no-grouping semantics).
+    """
+    if config.col_tile <= 0:
+        return 1
+    return max(1, -(-in_f // config.col_tile))
+
+
 def vptq_quantize(
     W: torch.Tensor,
     hessian: torch.Tensor,
@@ -593,11 +607,13 @@ def vptq_quantize(
         else cholesky_upper_of_inv(hessian, config.damp)
     )
 
-    # column groups along in_features
+    # column groups along in_features (fixed col_tile width, see
+    # _num_col_groups: w2 gets in_f//col_tile groups -> uniform 32x32 tiles)
+    g_eff = _num_col_groups(config, in_f)
     bounds = []
-    for gi in range(config.group_num):
-        cs = gi * in_f // config.group_num
-        ce = (gi + 1) * in_f // config.group_num
+    for gi in range(g_eff):
+        cs = gi * in_f // g_eff
+        ce = (gi + 1) * in_f // g_eff
         bounds.append((cs, ce))
 
     # --- stage 1: weighted k-means init per (col group, row span) tile ---
@@ -764,9 +780,10 @@ def vptq_quantize_joint(
         if hessian_inv_upper is not None
         else cholesky_upper_of_inv(hessian, config.damp)
     )
+    g_eff = _num_col_groups(config, in_f)
     bounds = [
-        (gi * in_f // config.group_num, (gi + 1) * in_f // config.group_num)
-        for gi in range(config.group_num)
+        (gi * in_f // g_eff, (gi + 1) * in_f // g_eff)
+        for gi in range(g_eff)
     ]
     diag_h = torch.diagonal(hessian).float().cpu()
     spans = row_spans or [(0, Wps[0].shape[0])]
